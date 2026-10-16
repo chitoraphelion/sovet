@@ -41,8 +41,10 @@ Never poll, inject terminal keystrokes, or run a second CLI against a foreground
 Use inbox to claim queued work, job_finish to return the concrete result. Stop hooks can also publish final
 answers. Respect the supplied depth limit; peer-result receipts must not create another review chain.
 If a prompt conflicts with a queued job, follow the user's newest instruction and explain the conflict.
-Chitalka comments are author feedback: inspect source.file/line, quote and suggestion, edit source, verify PDF,
-and reply via chitalka_reply. Only the writer replies/closes comments. If latexmk -pvc is already running,
+Chitalka reads PDF and Markdown with KaTeX math. Comments are author feedback: inspect document,
+source.file/line/lineEnd, quote and suggestion, edit source and verify the result. For source.how=markdown,
+line ranges identify the Markdown block and quote preserves TeX formulas; saving .md auto-refreshes the reader
+without latexmk. For PDF, rebuild/verify the PDF. Reply via chitalka_reply. Only the writer replies/closes comments. If latexmk -pvc is already running,
 read kommentarii/latexmk.log rather than starting another watcher.
 {profile_context(project)}
 {aris_context(project) if project.config.get('profile') == 'math-research' else 'Research automation is disabled in programming mode.'}

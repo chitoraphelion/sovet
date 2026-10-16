@@ -65,6 +65,8 @@ sovet run codex                                            # одна задач
 ```sh
 sovet up --reader --latex-watch       # окно chitalka в tmux
 sovet reader build/main.pdf --watch   # то же в текущем терминале
+sovet reader notes.md                # Markdown с KaTeX, обновляется без latexmk
+sovet up --reader --document notes.md # тот же документ при следующих запусках
 sovet chitalka list --json            # любая команда chitalka для этого проекта
 sovet chitalka show COMMENT_ID
 sovet chitalka reply COMMENT_ID 'Исправлено main.tex:42' --done

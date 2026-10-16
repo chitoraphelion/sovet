@@ -24,9 +24,11 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "bin/sovet"
 def protocol(project, role, read_only):
     reader_instructions = ""
     if project.config.get("profile") == "math-research" or project.config.get("reader"):
-        reader_instructions = """Chitalka is the author's native PDF/LaTeX reader. Use chitalka_list and chitalka_reply,
-preserve all author text and thread entries. Inspect source.file/line and quote, edit sources, verify/rebuild
-PDF, then reply in the same comment. If latexmk -pvc already runs, inspect kommentarii/latexmk.log instead
+        reader_instructions = """Chitalka is the author's native PDF and Markdown reader with KaTeX math. Use chitalka_list and chitalka_reply,
+preserve all author text and thread entries. Inspect document, source.file/line/lineEnd and quote.
+For source.how=markdown, the source range identifies a Markdown block and quote preserves TeX formulas;
+edit .md and verify the rendering (it auto-refreshes, no latexmk). For PDF, edit sources and verify/rebuild
+PDF. Then reply in the same comment. If latexmk -pvc already runs, inspect kommentarii/latexmk.log instead
 of launching a second watcher. Only the writer replies to comments. Never close an unverified fix."""
     return f"""You are {role}, one member of a sovet team. Project: {project.root}.
 Your native conversation is persistent. Your teammate has a separate conversation.

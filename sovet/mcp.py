@@ -29,7 +29,7 @@ TOOLS = [
     tool("artifact_write", "Записать результат, только если SHA совпадает с прочитанной версией. "
          "При конфликте перечитайте файл и сохраните изменения автора.",
          {"path": S, "text": S, "expected_sha": S}, ("path", "text", "expected_sha")),
-    tool("chitalka_list", "Получить комментарии автора с точными местами в .tex"),
+    tool("chitalka_list", "Получить комментарии автора к PDF/Markdown с source.file и строками блока .tex/.md"),
     tool("chitalka_reply", "Ответить в существующей карточке chitalka. Закрывать только после проверки результата.",
          {"id": S, "text": S, "done": {"type": "boolean"}}, ("id", "text")),
 ]
