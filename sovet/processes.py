@@ -152,11 +152,11 @@ def legacy(p, tool):
             if len(args) < 2:
                 return None
             root_arg, args = args[1], args[2:]
-        if not args or args[0] not in ("panel", "watch", "reader", "run", "research", "mcp"):
+        if not args or args[0] not in ("native", "panel", "watch", "reader", "run", "research", "mcp"):
             return None
         if args[0] == "research" and args[1:2] != ["setup"]:
             return None
-        kind = args[0] + (":" + args[1] if args[0] in ("panel", "run") and len(args) > 1 else "")
+        kind = args[0] + (":" + args[1] if args[0] in ("native", "panel", "run") and len(args) > 1 else "")
     else:
         if args and args[0] in {"list", "show", "reply", "done", "reopen", "init", "where", "sessions", "ps",
                                  "stop", "completion", "_complete", "--help", "-h", "--version", "-V"}:

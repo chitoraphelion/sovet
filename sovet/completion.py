@@ -51,4 +51,6 @@ def complete(words):
             if chain[-1] == "check":
                 return paths(prefix, base=lean)
         return None
-    return candidates(parser(), words, dynamic)
+    from .cli import INTERNAL
+    # No user-facing positional takes these values, so they can be dropped everywhere.
+    return [c for c in candidates(parser(), words, dynamic) if c not in INTERNAL]

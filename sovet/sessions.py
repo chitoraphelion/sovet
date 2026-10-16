@@ -71,6 +71,18 @@ def stop_sessions(target=None, root=None, all_sessions=False, force=False, timeo
     return result
 
 
+KINDS = {"native": "{} (нативный TUI)", "launcher": "запуск {}", "panel": "{}: старая curses-панель",
+         "run": "sovet run {}", "agent": "{}: headless-ход"}
+SERVICES = {"watch": "наблюдатель файлов", "reader": "chitalka", "mcp": "MCP-сервер", "research": "research setup"}
+
+
+def describe(kind):
+    base, _, role = kind.partition(":")
+    if role and base in KINDS:
+        return KINDS[base].format(role.capitalize())
+    return SERVICES.get(base, kind)
+
+
 def display(groups):
     if not groups:
         return "Нет запущенных сессий sovet."
@@ -78,6 +90,6 @@ def display(groups):
     for group in groups:
         lines.append(f"{group['id']}  {group['root'] or '(проект неизвестен)'}")
         for proc in group["processes"]:
-            lines.append(f"  PID {proc['pid']}  {proc['kind']}  {proc['state']}  "
+            lines.append(f"  PID {proc['pid']:<7} {describe(proc['kind']):<28} {proc['state']:<5} "
                          f"дочерние: {','.join(map(str, proc['children'])) or '-'}")
     return "\n".join(lines)

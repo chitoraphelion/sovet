@@ -172,7 +172,10 @@ class NativeRun:
                 except (BrokenPipeError, OSError):
                     pass
                 finally:
-                    p.stdin.close()
+                    try:
+                        p.stdin.close()
+                    except (BrokenPipeError, OSError):
+                        pass
             threading.Thread(target=writer, daemon=True).start()
             started = time.monotonic()
             cancelled_at = None

@@ -3,32 +3,45 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from . import __version__
 from .core import MEMORIES, ROLES, Project, digest, find_root, lock
-from .integrations import chitalka, install_aris, scan_files, sync_comments, sync_aris_profile
+from .integrations import chitalka, install_aris, metadata, scan_files, sync_comments, sync_aris_profile
 from .runtime import LAUNCHER, execute_next, worker_lock
+
+NAMES = {"codex": "Codex", "claude": "Claude"}
+# Internal entry points launched by tmux, hooks or MCP clients. Added without help=,
+# so argparse omits them from --help; completion.py hides them from Tab.
+INTERNAL = ("native", "panel", "hook", "mcp", "watch")
+DETACHED_SIZE = (160, 45)  # no terminal to measure: room for two ~80-column TUIs, not tmux 80x24
+PLACEHOLDER = "sleep 600"
+PANE_FORMAT = "\t".join(["#{window_id}", "#{window_name}", "#{@sovet_window}", "#{@sovet_cmd}", "#{pane_id}",
+                         "#{@sovet_role}", "#{pane_dead}", "#{pane_pid}", "#{pane_start_command}"])
 
 
 def flags(parser):
     profile = parser.add_mutually_exclusive_group()
-    profile.add_argument("--math-research", action="store_const", const="math-research", dest="profile")
-    profile.add_argument("--programming", action="store_const", const="programming", dest="profile")
-    parser.add_argument("--writer", choices=ROLES)
+    profile.add_argument("--math-research", action="store_const", const="math-research", dest="profile",
+                         help="Lean/LongTails, ARIS, chitalka")
+    profile.add_argument("--programming", action="store_const", const="programming", dest="profile",
+                         help="без исследовательских инструментов")
+    parser.add_argument("--writer", choices=ROLES, help="кто меняет файлы (второй агент — ревьюер)")
     for role in ROLES:
-        parser.add_argument(f"--{role}-model")
+        parser.add_argument(f"--{role}-model", metavar="ID", help=f"точный ID модели {NAMES[role]}")
         parser.add_argument(f"--{role}-effort", choices=["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
                             if role == "codex" else ["low", "medium", "high", "xhigh", "max"])
 
 
-def configure(project, args):
+def configure(project, args, persist=True):
     if getattr(args, "profile", None) == "programming":
         project.config["reader"] = False
     for key in ("profile", "writer"):
@@ -39,10 +52,14 @@ def configure(project, args):
             value = getattr(args, f"{role}_{key}", None)
             if value:
                 project.config[group][role] = value
-    if getattr(args, "reader", False):
+    if getattr(args, "reader", False) or getattr(args, "pdf", None) or getattr(args, "latex_watch", False):
         project.config["reader"] = True
-    project.save_config()
-    sync_aris_profile(project)
+        # Remembered so a later plain `sovet up` reopens chitalka the same way.
+        project.config["reader_options"] = {"pdf": getattr(args, "pdf", None),
+                                            "watch": bool(getattr(args, "latex_watch", False))}
+    if persist:
+        project.save_config()
+        sync_aris_profile(project)
 
 
 def session_name(project):
@@ -54,46 +71,227 @@ def launch_command(project, *args):
     return shlex.join([sys.executable, str(LAUNCHER), "--project", str(project.root), *args])
 
 
-def tmux(project, args):
-    if not shutil.which("tmux"):
-        raise ValueError("Нужен tmux: brew install tmux")
+def role_label(project, role):
+    cfg = project.config
+    duty = "писатель" if role == cfg["writer"] else "ревьюер"
+    return f"{NAMES[role]} · {duty} · {cfg['models'][role]} · {cfg['effort'][role]}"
+
+
+def reader_command(project, args):
+    options = project.config.get("reader_options") or {}
+    reader = ["reader"]
+    if options.get("pdf"):
+        reader.append(options["pdf"])
+    if options.get("watch"):
+        reader.append("--watch")
+    if getattr(args, "no_browser", False):
+        reader.append("--no-browser")
+    return launch_command(project, *reader)
+
+
+def window_size(detached):
+    """The real terminal when attaching (never larger: no cropping or panning); 160x45 otherwise."""
+    if detached:
+        return DETACHED_SIZE
+    size = shutil.get_terminal_size((0, 0))
+    return (size.columns, size.lines) if size.columns and size.lines else DETACHED_SIZE
+
+
+class Tmux:
+    """Queries always run (read-only); mutations are printed instead of executed in dry-run."""
+
+    def __init__(self, dry_run=False):
+        self.dry_run = dry_run
+
+    def query(self, *args):
+        if not shutil.which("tmux"):
+            return None
+        result = subprocess.run(["tmux", *args], capture_output=True, text=True)
+        return result.stdout if result.returncode == 0 else None
+
+    def __call__(self, *args, output=None):
+        """Run a mutation; with output (a dry-run stand-in such as "@1\t%1") return its -P output."""
+        if self.dry_run:
+            print("tmux " + shlex.join(args))
+            return output or ""
+        if output:
+            return subprocess.check_output(["tmux", *args], text=True).strip()
+        subprocess.run(["tmux", *args], check=True, stdout=subprocess.DEVNULL)
+        return ""
+
+
+def pane_role(command):
+    """Role launched by a sovet pane command, ignoring any words inside the project path."""
+    found = re.findall(r"(?:^|[\s'\"])(native|panel)\s+(codex|claude)\b", command or "")
+    return found[-1] if found else (None, None)
+
+
+def inventory(t, name):
+    panes = []
+    for line in (t.query("list-panes", "-s", "-t", "=" + name, "-F", PANE_FORMAT) or "").splitlines():
+        parts = line.split("\t", 8)
+        if len(parts) != 9:
+            continue
+        window, window_name, kind, service, pane, role, dead, pid, command = parts
+        launched, launched_role = pane_role(command)
+        if not kind and window_name in ("agents", "watch", "chitalka"):
+            kind = window_name  # sessions created before window tags existed
+        panes.append({"window": window, "window_kind": kind, "pane": pane, "role": role or launched_role,
+                      "dead": dead == "1", "pid": int(pid) if pid.isdecimal() else None,
+                      "launch": launched, "service": service})
+    return panes
+
+
+def tmux_state(project):
     name = session_name(project)
-    exists = subprocess.run(["tmux", "has-session", "-t", "=" + name], capture_output=True).returncode == 0
-    if not exists:
-        # Exact session/window/pane targets avoid ambiguous tmux prefix matching.
-        first = subprocess.check_output(["tmux", "new-session", "-d", "-P", "-F", "#{pane_id}",
-                                         "-s", name, "-n", "agents", "-c", str(project.root),
-                                         launch_command(project, "panel", "codex")], text=True).strip()
-        try:
-            subprocess.run(["tmux", "split-window", "-h", "-t", first, "-c", str(project.root),
-                            launch_command(project, "panel", "claude")], check=True)
-            subprocess.run(["tmux", "select-pane", "-t", first], check=True)
-        except Exception:
-            subprocess.run(["tmux", "kill-session", "-t", "=" + name])
-            raise
-    windows = subprocess.check_output(["tmux", "list-windows", "-t", "=" + name, "-F", "#{window_name}"], text=True).splitlines()
-    if args.profile == "programming" and not args.reader and "chitalka" in windows:
-        subprocess.run(["tmux", "kill-window", "-t", name + ":chitalka"], check=True)
-    if "watch" not in windows:
-        subprocess.run(["tmux", "new-window", "-d", "-t", name + ":", "-n", "watch",
-                        launch_command(project, "watch")], check=True)
-    if getattr(args, "reader", False) and "chitalka" not in windows:
-        reader = ["reader"]
-        if args.pdf:
-            reader += [args.pdf]
-        if args.latex_watch:
-            reader += ["--watch"]
-        if args.no_browser:
-            reader += ["--no-browser"]
-        subprocess.run(["tmux", "new-window", "-d", "-t", name + ":", "-n", "chitalka",
-                        launch_command(project, *reader)], check=True)
-    print(f"tmux: {name}\nCodex слева · Claude справа. Ctrl+b ←/→; Ctrl+b d — отсоединиться.")
-    if not args.detach:
-        if os.environ.get("TMUX"):
-            subprocess.run(["tmux", "switch-client", "-t", "=" + name], check=True)
+    t = Tmux()
+    exists = t.query("has-session", "-t", "=" + name) is not None
+    panes = inventory(t, name) if exists else []
+    agents = {p["role"]: p for p in panes if p["window_kind"] == "agents" and p["role"] in ROLES}
+    services = {p["window_kind"]: p for p in panes if p["window_kind"] in ("watch", "chitalka")}
+    return {"session": name, "exists": exists, "agents": agents, "services": services}
+
+
+def tmux(project, args):
+    dry = getattr(args, "dry_run", False)
+    restart = getattr(args, "restart", False)
+    missing = [tool for tool in ("tmux", *ROLES) if not shutil.which(tool)]
+    if missing and not dry:
+        raise ValueError(f"Не найдено в PATH: {', '.join(missing)}. Проверьте: sovet doctor")
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    t = Tmux(dry)
+    name = session_name(project)
+    target = "=" + name
+    root = str(project.root)
+    exists = t.query("has-session", "-t", target) is not None
+    panes = inventory(t, name) if exists else []
+
+    def window_of(kind):
+        return next((p["window"] for p in panes if p["window_kind"] == kind), None)
+
+    agents_window = window_of("agents")
+    agents = {p["role"]: p for p in panes if p["window"] == agents_window and p["role"] in ROLES}
+    legacy = [r for r, p in agents.items() if p["launch"] == "panel" and not p["dead"]]
+    if legacy and not restart:
+        running = [j for j in project.jobs() if j["status"] == "running" and j["role"] in legacy]
+        if running:
+            raise ValueError(
+                f"В {name} ещё открыта старая curses-панель ({', '.join(legacy)}), и она выполняет задачу "
+                f"#{running[0]['id']} в фоновом режиме. Автоматическая замена оборвала бы этот ход посреди правок. "
+                "Дождитесь окончания (sovet status) или перезапустите явно: sovet up --restart")
+
+    def open_window(kind):
+        # Start with a placeholder so remain-on-exit is set before any real program can exit.
+        stand_in = f"@{kind}\t%{'codex' if kind == 'agents' else kind}"
+        if not exists and kind == "agents":
+            cols, rows = window_size(getattr(args, "detach", False) or not interactive)
+            out = t("new-session", "-d", "-P", "-F", "#{window_id}\t#{pane_id}", "-s", name, "-n", kind,
+                    "-x", str(cols), "-y", str(rows), "-c", root, PLACEHOLDER, output=stand_in)
         else:
-            return subprocess.call(["tmux", "attach-session", "-t", "=" + name])
-    return 0
+            out = t("new-window", "-d", "-P", "-F", "#{window_id}\t#{pane_id}", "-t", target + ":", "-n", kind,
+                    "-c", root, PLACEHOLDER, output=stand_in)
+        window, pane = out.split("\t")
+        t("set-option", "-w", "-t", window, "@sovet_window", kind)
+        t("set-option", "-w", "-t", window, "remain-on-exit", "on")
+        return window, pane
+
+    created = not exists
+    try:
+        if agents_window is None:
+            agents_window, first = open_window("agents")
+            agents = {"codex": {"pane": first, "dead": False, "launch": None}}
+        else:
+            t("set-option", "-w", "-t", agents_window, "remain-on-exit", "on")
+            t("set-option", "-w", "-t", agents_window, "@sovet_window", "agents")
+        t("set-option", "-w", "-t", agents_window, "pane-border-status", "top")
+        t("set-option", "-w", "-t", agents_window, "pane-border-format",
+          " #{?pane_active,▶ ,}#{?#{@sovet_label},#{@sovet_label},#{pane_title}} ")
+        t("set-option", "-t", target + ":", "mouse", "on")  # option targets need "=name:", not "=name"
+        for role in ROLES:  # codex first: it is the left column
+            command = launch_command(project, "native", role)
+            pane = agents.get(role)
+            if pane is None:
+                peer = agents.get("claude" if role == "codex" else "codex")
+                anchor = peer["pane"] if peer else next(p["pane"] for p in panes if p["window"] == agents_window)
+                side = ["-b"] if role == "codex" else []  # codex left of claude, claude right of codex
+                new = t("split-window", "-h", *side, "-d", "-P", "-F", "#{pane_id}", "-t", anchor,
+                        "-c", root, command, output=f"%{role}")
+                agents[role] = {"pane": new}
+            elif pane["dead"] or pane["launch"] != "native" or restart:
+                t("respawn-pane", "-k", "-t", pane["pane"], "-c", root, command)
+            t("set-option", "-p", "-t", agents[role]["pane"], "@sovet_role", role)
+            t("set-option", "-p", "-t", agents[role]["pane"], "@sovet_label", role_label(project, role))
+        t("select-layout", "-t", agents_window, "even-horizontal")
+
+        services = {"watch": launch_command(project, "watch")}
+        if project.config.get("reader"):
+            services["chitalka"] = reader_command(project, args)
+        elif window_of("chitalka"):
+            t("kill-window", "-t", window_of("chitalka"))
+        for kind, command in services.items():
+            window = window_of(kind)
+            if window is None:
+                window, pane = open_window(kind)
+            else:
+                current = next(p for p in panes if p["window"] == window)
+                pane = current["pane"]
+                t("set-option", "-w", "-t", window, "@sovet_window", kind)
+                if not (current["dead"] or restart):
+                    if kind == "chitalka" and current["service"] != command and (
+                            args.reader or args.pdf or args.latex_watch):
+                        print("chitalka уже открыта с другими параметрами; они применятся после sovet up --restart")
+                    continue
+            t("set-option", "-w", "-t", window, "@sovet_cmd", command)
+            t("respawn-pane", "-k", "-t", pane, "-c", root, command)
+        t("select-window", "-t", agents_window)
+        t("select-pane", "-t", agents[project.config["writer"]]["pane"])
+    except Exception:
+        if created and not dry:
+            subprocess.run(["tmux", "kill-session", "-t", target], capture_output=True)
+        raise
+    if dry:
+        return 0
+    writer = NAMES[project.config["writer"]]
+    hint = (f"tmux {name}: слева Codex, справа Claude. Курсор в панели {writer} (писатель).\n"
+            "Ctrl-b ←/→ или щелчок мышью — другая панель; Ctrl-b w — окна watch/chitalka; "
+            "Ctrl-b d — отсоединиться (агенты продолжат работу).\n"
+            "Вернуться: sovet up · состояние: sovet status · остановить: sovet stop")
+    if os.environ.get("TMUX") and not args.detach:
+        subprocess.run(["tmux", "switch-client", "-t", target], check=True)
+        return 0
+    if args.detach or not interactive:
+        print(hint + ("" if args.detach else "\nНет терминала, поэтому сессия открыта в фоне."))
+        return 0
+    code = subprocess.call(["tmux", "attach-session", "-t", target])
+    print(hint.splitlines()[-1])
+    return code
+
+
+def live_processes(project):
+    """ps-backed sovet processes of this project, or None when ps is unavailable."""
+    from .sessions import list_sessions
+    try:
+        return [p for group in list_sessions(project.root) for p in group["processes"]]
+    except RuntimeError:
+        return None
+
+
+def wait_for_role(project, role, timeout=20):
+    """A just-replaced pane may still be releasing the role lock; wait briefly instead of failing."""
+    deadline = time.monotonic() + timeout
+    announced = False
+    while True:
+        try:
+            with worker_lock(project, role):
+                return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise ValueError(f"{NAMES[role]} этого проекта уже открыт в другом процессе (sovet status). "
+                                 "Второй экземпляр в том же разговоре не запускается.")
+            if not announced:
+                print(f"Жду, пока предыдущий процесс {NAMES[role]} освободит роль…", flush=True)
+                announced = True
+            time.sleep(0.25)
 
 
 def watch(project, once=False):
@@ -103,6 +301,9 @@ def watch(project, once=False):
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, end)
     with lock(project.team / "watch.lock", blocking=False):
+        if not once:
+            print(f"sovet watch: {project.root}\nСледит за правками файлов и комментариями chitalka. "
+                  "Это служебное окно; агенты — в окне agents (Ctrl-b w).", flush=True)
         last_error = None
         while not stop.is_set():
             try:
@@ -111,7 +312,7 @@ def watch(project, once=False):
                 feedback = sync_comments(project) if (project.config.get("profile") == "math-research" or
                                                        project.config.get("reader")) else 0
                 if changed or feedback:
-                    print(f"Изменений: {changed}; комментариев автора: {feedback}", flush=True)
+                    print(f"{time.strftime('%H:%M:%S')} изменений: {changed}; комментариев автора: {feedback}", flush=True)
                 last_error = None
             except Exception as e:
                 if str(e) != last_error:
@@ -123,38 +324,125 @@ def watch(project, once=False):
             stop.wait(1)
 
 
+STATUS = {"pending": "ждёт", "running": "выполняется", "completed": "готово", "failed": "ошибка"}
+DELIVERY = ("Задачи очереди получает нативная панель роли: сразу после завершения текущего хода (Stop hook) "
+            "или, если агент простаивает, при вашем следующем сообщении в его панели. "
+            "Сама по себе простаивающая панель ничего не начинает.")
+
+
+def status_data(project):
+    processes = live_processes(project)
+    state = tmux_state(project)
+    agents = {}
+    for role in ROLES:
+        live = [p for p in processes or [] if p["kind"] in (f"native:{role}", f"panel:{role}")]
+        agents[role] = {**project.agent(role), "model": project.config["models"][role],
+                        "effort": project.config["effort"][role],
+                        "duty": "writer" if role == project.config["writer"] else "reviewer",
+                        "pids": [p["pid"] for p in live],
+                        "legacy_panel": any(p["kind"].startswith("panel:") for p in live),
+                        # The agents table may still hold a pre-native batch ID; only this one is resumed.
+                        "native_session": metadata(project, f"native:{role}:session"),
+                        "pane": state["agents"].get(role)}
+    services = {kind: [p["pid"] for p in processes or [] if p["kind"] == kind] for kind in ("watch", "reader")}
+    return {"project": str(project.root), "profile": project.config["profile"], "writer": project.config["writer"],
+            "reader": bool(project.config.get("reader")), "tmux": {"session": state["session"], "exists": state["exists"]},
+            "ps_available": processes is not None, "agents": agents, "services": services, "jobs": project.jobs()}
+
+
+def status_text(data):
+    def short(text, width=64):
+        line = " ".join(str(text or "").split())
+        return line if len(line) <= width else line[:width - 1] + "…"
+    lines = [f"sovet · {data['project']}",
+             f"Профиль: {data['profile']} · chitalka: {'да' if data['reader'] else 'нет'} · "
+             f"писатель: {NAMES[data['writer']]}",
+             f"tmux: {data['tmux']['session']} — " + ("запущена (открыть: sovet up)" if data["tmux"]["exists"]
+                                                       else "не запущена (sovet up)"), ""]
+    for role in (data["writer"], *[r for r in ROLES if r != data["writer"]]):
+        a = data["agents"][role]
+        side = "слева" if role == "codex" else "справа"
+        if a["legacy_panel"]:
+            state = "старая curses-панель → sovet up --restart"
+        elif a["pids"]:
+            state = f"открыт, PID {','.join(map(str, a['pids']))}"
+        elif a["pane"] and a["pane"]["dead"]:
+            state = "панель закрыта (sovet up перезапустит)"
+        else:
+            state = "не запущен" if data["ps_available"] else "неизвестно (ps недоступен)"
+        session = f" · разговор {a['native_session'][:8]}…" if a.get("native_session") else ""
+        model = f"{a['model']} · {a['effort']}"
+        lines.append(f"  {NAMES[role]:<7}{('писатель' if a['duty'] == 'writer' else 'ревьюер'):<10}"
+                     f"{model:<28} {side:<7} {state}{session}")
+    services = " · ".join(f"{name} PID {','.join(map(str, pids))}" if pids else f"{name}: нет"
+                          for name, pids in data["services"].items())
+    lines += [f"  Службы: {services}", ""]
+    jobs = data["jobs"]
+    waiting = [j for j in jobs if j["status"] == "pending"]
+    running = [j for j in jobs if j["status"] == "running"]
+    lines.append(f"Очередь: ждут {len(waiting)}, выполняются {len(running)}")
+    shown = (running + waiting)[:8] or jobs[:3]
+    for j in shown:
+        lines.append(f"  #{j['id']:<4} → {NAMES[j['role']]:<7}{STATUS.get(j['status'], j['status']):<12}"
+                     f"от {j['origin']:<12} {short(j['prompt'])}")
+    if waiting:
+        lines += ["", DELIVERY]
+    lines.append("Подробно: sovet events · sovet status --json")
+    return "\n".join(lines)
+
+
+def queued_message(project, role, job):
+    live = live_processes(project)
+    open_now = live is not None and any(p["kind"] == f"native:{role}" for p in live)
+    where = (f"{NAMES[role]} открыт: получит её после текущего хода или при вашем следующем сообщении в его панели."
+             if open_now else f"{NAMES[role]} сейчас не открыт: sovet up, затем напишите агенту в его панели.")
+    return f"Задача #{job} поставлена в очередь {NAMES[role]}. {where}"
+
+
 def parser():
-    p = argparse.ArgumentParser(prog="sovet", description="Claude пишет, Codex проверяет. Общая память, tmux, ARIS, chitalka, Lean.")
+    p = argparse.ArgumentParser(
+        prog="sovet", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Два нативных агента в одном окне tmux: Codex слева, Claude справа.\n"
+                    "Писатель меняет файлы, ревьюер проверяет. Общая память проекта, ARIS, chitalka, Lean.",
+        epilog="Начало: sovet init && sovet up. Подробно: README.md, docs/usage.md.")
     p.add_argument("-C", "--project", help="путь к проекту (можно из подкаталога)")
     p.add_argument("--version", action="version", version=f"sovet {__version__}")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="КОМАНДА")
     init = sub.add_parser("init", help="создать .team/ в проекте")
     init.add_argument("path", nargs="?", default=".")
     init.add_argument("--brief", default="")
     init.add_argument("--aris", type=Path, help="локальный checkout ARIS")
     flags(init)
-    up = sub.add_parser("up", help="открыть двух агентов рядом в tmux")
-    up.add_argument("--detach", action="store_true")
-    up.add_argument("--reader", action="store_true", help="также запустить chitalka")
-    up.add_argument("--pdf")
-    up.add_argument("--latex-watch", action="store_true")
-    up.add_argument("--no-browser", action="store_true", help="не открывать браузер при запуске reader")
+    up = sub.add_parser("up", help="открыть Codex и Claude рядом в tmux (или вернуться в сессию)")
+    up.add_argument("--detach", action="store_true", help="запустить в фоне, не подключаясь")
+    up.add_argument("--restart", action="store_true",
+                    help="перезапустить агентов и службы этой сессии (история разговоров сохраняется)")
+    up.add_argument("--dry-run", action="store_true", help="показать команды tmux и ничего не менять")
+    up.add_argument("--reader", action="store_true", help="также открыть chitalka (запоминается)")
+    up.add_argument("--pdf", help="PDF для chitalka (запоминается)")
+    up.add_argument("--latex-watch", action="store_true", help="chitalka пересобирает LaTeX (запоминается)")
+    up.add_argument("--no-browser", action="store_true", help="не открывать браузер для chitalka")
     flags(up)
     config = sub.add_parser("config", help="показать/изменить конфиг проекта; флаги сохраняются")
     flags(config)
-    for name in ("panel", "run"):
-        s = sub.add_parser(name, help="терминальный чат" if name == "panel" else "обработать одну задачу без tmux")
+    for name in ("native", "panel"):
+        s = sub.add_parser(name)  # panel: pre-native alias kept for old tmux sessions
         s.add_argument("role", choices=ROLES)
-    send = sub.add_parser("send", help="поставить агенту задачу")
+    run = sub.add_parser("run", help="выполнить одну задачу очереди без TUI (только если роль не открыта)")
+    run.add_argument("role", choices=ROLES)
+    send = sub.add_parser("send", help="поставить задачу в очередь агента")
     send.add_argument("role", choices=ROLES)
     send.add_argument("text", help="текст или - для stdin")
     send.add_argument("--read-only", action="store_true")
-    review = sub.add_parser("review", help="попросить ревьюера проверить текущий результат")
+    send.add_argument("--json", action="store_true")
+    review = sub.add_parser("review", help="поставить ревьюеру задачу проверить текущий результат")
     review.add_argument("text", nargs="?", default="Проверьте актуальные изменения, требования и результаты проверок. Сообщите конкретные замечания.")
+    review.add_argument("--json", action="store_true")
     events = sub.add_parser("events", help="общая история")
     events.add_argument("--after", type=int, default=0)
     events.add_argument("--json", action="store_true")
-    sub.add_parser("status", help="сессии, очередь и роли")
+    status = sub.add_parser("status", help="кто открыт, tmux, очередь")
+    status.add_argument("--json", action="store_true")
     sessions = sub.add_parser("sessions", aliases=["ps"], help="все запущенные сессии по ps")
     sessions.add_argument("--json", action="store_true")
     sessions.add_argument("--ids", action="store_true", help=argparse.SUPPRESS)
@@ -169,7 +457,7 @@ def parser():
     completion = sub.add_parser("completion", help="Tab-автодополнение zsh/bash")
     completion.add_argument("shell", choices=["zsh", "bash"])
     completion.add_argument("--install", action="store_true", help="подключить в конфиг текущего пользователя")
-    w = sub.add_parser("watch", help="следить за файлами и обратной связью chitalka")
+    w = sub.add_parser("watch")
     w.add_argument("--once", action="store_true")
     memory = sub.add_parser("memory", help="общая память")
     memory.add_argument("name", choices=MEMORIES)
@@ -199,10 +487,14 @@ def parser():
     for name in ("check", "build", "audit", "search"):
         q = r.add_parser(name)
         q.add_argument("target", nargs="?" if name == "build" else None)
-    mcp = sub.add_parser("mcp", help="внутренний stdio MCP для агентских CLI")
+    hook = sub.add_parser("hook")
+    hook.add_argument("--role", choices=ROLES, required=True)
+    hook.add_argument("--event", required=True)
+    mcp = sub.add_parser("mcp")
     mcp.add_argument("--role", choices=ROLES, required=True)
     mcp.add_argument("--depth", type=int, default=0)
     mcp.add_argument("--read-only", action="store_true")
+    mcp.add_argument("--native", action="store_true")
     return p
 
 
@@ -218,10 +510,15 @@ def main(argv=None):
         return 0
     args = parser().parse_args(argv)
     try:
-        if args.cmd in ("panel", "run", "watch", "reader", "mcp") or (args.cmd == "research" and args.action == "setup"):
+        if args.cmd in ("native", "panel"):
+            # run_native registers the harness itself as native:ROLE; this is its launcher.
+            from .processes import tracked
+            with tracked("sovet", "launcher:" + args.role, find_root(args.project)):
+                return dispatch(args) or 0
+        if args.cmd in ("run", "watch", "reader", "mcp") or (args.cmd == "research" and args.action == "setup"):
             from .processes import tracked
             root = find_root(args.project)
-            kind = args.cmd + (":" + args.role if args.cmd in ("panel", "run") else "")
+            kind = args.cmd + (":" + args.role if args.cmd == "run" else "")
             with tracked("sovet", kind, root):
                 return dispatch(args) or 0
         return dispatch(args) or 0
@@ -247,7 +544,8 @@ def dispatch(args):
         from .sessions import stop_sessions
         result = stop_sessions(args.target, args.project, args.all, args.force, args.timeout)
         print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else
-              f"Остановлены PID: {result['stopped'] or '-'}; остались: {result['remaining'] or '-'}")
+              f"Остановлены PID: {result['stopped'] or '-'}; остались: {result['remaining'] or '-'}"
+              + ("" if result["remaining"] else "\nИстория, память .team/ и очередь сохранены; sovet up — запустить снова."))
         return 1 if result["remaining"] or result["errors"] else 0
     if args.cmd == "init":
         project = Project.init(Path(args.project or args.path), writer=args.writer or "claude", brief=args.brief)
@@ -256,7 +554,7 @@ def dispatch(args):
         if args.aris or (repo / "skills/research-wiki/SKILL.md").exists():
             install_aris(project, repo)
         scan_files(project)
-        print(f"Готово: {project.root}\nИсполнитель: {project.config['writer']}; профиль: {project.config['profile']}")
+        print(f"Готово: {project.root}\nПисатель: {project.config['writer']}; профиль: {project.config['profile']}")
         print("Дальше: sovet up" if not args.project else f"Дальше: sovet -C {shlex.quote(str(project.root))} up")
         return
     if args.cmd == "doctor":
@@ -274,31 +572,49 @@ def dispatch(args):
         return 0 if all(tools.get(k) for k in ("codex", "claude", "tmux")) else 1
     project = Project(find_root(args.project))
     if args.cmd in ("config", "up"):
-        configure(project, args)
+        configure(project, args, persist=not getattr(args, "dry_run", False))
         if args.cmd == "config":
             print(json.dumps(project.config, ensure_ascii=False, indent=2))
         else:
             return tmux(project, args)
-    elif args.cmd == "panel":
-        from .ui import panel
-        panel(project, args.role)
+    elif args.cmd in ("native", "panel"):
+        wait_for_role(project, args.role)
+        try:
+            from .native import run_native
+        except ImportError as e:
+            raise RuntimeError(f"нативный запуск недоступен в этой версии sovet: {e}") from e
+        return run_native(project, args.role)
+    elif args.cmd == "hook":
+        from .bridge import main_hook
+        return main_hook(project, args.role, args.event)
     elif args.cmd == "run":
-        with worker_lock(project, args.role):
-            result = execute_next(project, args.role)
-            return 1 if result and not result["ok"] else 0
-    elif args.cmd == "send":
-        print(project.enqueue(args.role, stdin_text(args.text), read_only=args.read_only))
-    elif args.cmd == "review":
-        reviewer = next(role for role in ROLES if role != project.config["writer"])
-        print(project.enqueue(reviewer, args.text, read_only=True, reply_to=project.config["writer"]))
+        live = live_processes(project) or []
+        if any(p["kind"] in (f"native:{args.role}", f"panel:{args.role}") for p in live):
+            raise ValueError(f"{NAMES[args.role]} открыт в tmux; задачу получит его панель. "
+                             "sovet run нужен только когда роль не открыта.")
+        try:
+            with worker_lock(project, args.role):
+                result = execute_next(project, args.role)
+        except BlockingIOError:
+            raise ValueError(f"{NAMES[args.role]} этого проекта уже занят другим процессом (sovet status)") from None
+        if result is None:
+            print("Очередь пуста.")
+        return 1 if result and not result["ok"] else 0
+    elif args.cmd in ("send", "review"):
+        if args.cmd == "send":
+            role = args.role
+            job = project.enqueue(role, stdin_text(args.text), read_only=args.read_only)
+        else:
+            role = next(r for r in ROLES if r != project.config["writer"])
+            job = project.enqueue(role, args.text, read_only=True, reply_to=project.config["writer"])
+        print(json.dumps({"job": job, "role": role}) if args.json else queued_message(project, role, job))
     elif args.cmd == "events":
         rows = project.events(args.after, limit=10000)
         print(json.dumps(rows, ensure_ascii=False, indent=2) if args.json else
               "\n\n".join(f"#{e['id']} {e['actor']} / {e['kind']}\n{e['body']}" for e in rows))
     elif args.cmd == "status":
-        print(json.dumps({"project": str(project.root), "profile": project.config["profile"],
-                          "writer": project.config["writer"], "agents": {r: project.agent(r) for r in ROLES},
-                          "jobs": project.jobs()}, ensure_ascii=False, indent=2))
+        data = status_data(project)
+        print(json.dumps(data, ensure_ascii=False, indent=2) if args.json else status_text(data))
     elif args.cmd == "watch":
         watch(project, args.once)
     elif args.cmd == "memory":
@@ -348,4 +664,7 @@ def dispatch(args):
             return result["exit_code"]
     elif args.cmd == "mcp":
         from .mcp import serve
-        serve(project, args.role, args.depth, args.read_only)
+        if args.native:
+            serve(project, args.role, args.depth, args.read_only, native=True)
+        else:
+            serve(project, args.role, args.depth, args.read_only)

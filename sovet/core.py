@@ -159,17 +159,30 @@ class Project:
                 return dict(row)
 
     def finish(self, job, result="", error=None):
-        with self.db() as db:
-            db.execute("UPDATE jobs SET status=?, result=?, error=?, finished=? WHERE id=?",
-                       ("failed" if error else "completed", result, error, time.time(), job["id"]))
-        self.emit(job["role"], "error" if error else "answer", error or result,
-                  {"job": job["id"], "reply_to": job["reply_to"]})
-        # A peer answer wakes the caller once. Its receipt cannot start another peer call.
+        receipt = None
         if job["reply_to"] and not error:
-            self.enqueue(job["reply_to"], f"Ответ {job['role']} на вашу задачу #{job['id']}:\n{result}\n"
-                         "Учтите результат и завершите свой ответ. Не вызывайте другого агента повторно.",
-                         origin="peer-result", depth=self.config["max_peer_depth"],
-                         read_only=job["reply_to"] != self.config["writer"])
+            if job["reply_to"] not in ROLES:
+                raise ValueError("Неизвестный получатель результата")
+            receipt = (f"Ответ {job['role']} на вашу задачу #{job['id']}:\n{result}\n"
+                       "Учтите результат и завершите свой ответ. Не вызывайте другого агента повторно.")
+        with self.db() as db:
+            changed = db.execute("UPDATE jobs SET status=?, result=?, error=?, finished=? WHERE id=? AND status='running'",
+                                 ("failed" if error else "completed", result, error, time.time(), job["id"]))
+            if changed.rowcount == 0:
+                return False
+            db.execute("INSERT INTO events(at,actor,kind,body,data) VALUES(?,?,?,?,?)",
+                       (time.time(), job["role"], "error" if error else "answer", error or result,
+                        json.dumps({"job": job["id"], "reply_to": job["reply_to"]})))
+            # Completion, its public answer and the return message must commit together.
+            # A crash cannot leave a completed review with a silently missing receipt.
+            if receipt is not None:
+                cur = db.execute("INSERT INTO jobs(role,prompt,origin,depth,read_only,reply_to,created) VALUES(?,?,?,?,?,?,?)",
+                                 (job["reply_to"], receipt, "peer-result", self.config["max_peer_depth"],
+                                  int(job["reply_to"] != self.config["writer"]), None, time.time()))
+                db.execute("INSERT INTO events(at,actor,kind,body,data) VALUES(?,?,?,?,?)",
+                           (time.time(), "peer-result", "request", receipt,
+                            json.dumps({"job": cur.lastrowid, "to": job["reply_to"]})))
+        return True
 
     def jobs(self):
         with self.db() as db:

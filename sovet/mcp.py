@@ -46,19 +46,35 @@ MATH_TOOLS = [
          {"theorem_file": S}, ("theorem_file",)),
 ]
 
+NATIVE_TOOLS = [
+    tool("inbox", "Получить текущее поручение или взять следующее из общей очереди. Не вызывайте в цикле."),
+    tool("job_finish", "Сохранить результат текущего поручения и вернуть его коллеге",
+         {"result": S, "job_id": {"type": "integer"}}, ("result",)),
+]
 
-def available_tools(project):
+
+def available_tools(project, native=False):
     tools = TOOLS[:]
     if project.config.get("profile") == "math-research":
         tools += MATH_TOOLS
     elif not project.config.get("reader"):
         tools = [t for t in tools if not t["name"].startswith("chitalka_")]
-    return tools
+    return tools + (NATIVE_TOOLS if native else [])
 
 
-def call(project, role, depth, read_only, name, args):
-    if name not in {t["name"] for t in available_tools(project)}:
+def call(project, role, depth, read_only, name, args, native=False):
+    if name not in {t["name"] for t in available_tools(project, native)}:
         raise ValueError(f"Инструмент не включён в текущем профиле: {name}")
+    if native:
+        from .bridge import active_job, inbox, complete_job
+        current = active_job(project, role)
+        if current:
+            depth = current["depth"]
+            read_only = read_only or bool(current["read_only"])
+        if name == "inbox":
+            return inbox(project, role)
+        if name == "job_finish":
+            return complete_job(project, role, args["result"], job_id=args.get("job_id"))
     if name == "lean_status":
         return verification_status(project)
     if name == "lean_check":
@@ -73,7 +89,9 @@ def call(project, role, depth, read_only, name, args):
         peer = next(r for r in ROLES if r != role)
         job_id = project.enqueue(peer, args["prompt"], origin=role, depth=depth + 1,
                                  read_only=True, reply_to=role)
-        return {"job_id": job_id, "to": peer, "delivery": "queued; keep working or finish your turn"}
+        return {"job_id": job_id, "to": peer, "delivery":
+                "queued for the peer's next native turn; idle panes need a user prompt to check inbox" if native else
+                "queued; keep working or finish your turn"}
     if name == "memory_read":
         return {"context": project.context(role)[0]}
     if name == "events_read":
@@ -94,7 +112,7 @@ def call(project, role, depth, read_only, name, args):
     raise ValueError(f"Неизвестный инструмент: {name}")
 
 
-def dispatch(project, role, depth, read_only, request):
+def dispatch(project, role, depth, read_only, request, native=False):
     rid = request.get("id")
     method = request.get("method")
     if rid is None:
@@ -104,11 +122,11 @@ def dispatch(project, role, depth, read_only, request):
         response["result"] = {"protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"),
                               "capabilities": {"tools": {}}, "serverInfo": {"name": "sovet", "version": "0.1.0"}}
     elif method == "tools/list":
-        response["result"] = {"tools": available_tools(project)}
+        response["result"] = {"tools": available_tools(project, native)}
     elif method == "tools/call":
         params = request.get("params", {})
         try:
-            value = call(project, role, depth, read_only, params.get("name"), params.get("arguments", {}))
+            value = call(project, role, depth, read_only, params.get("name"), params.get("arguments", {}), native)
             response["result"] = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}]}
         except Exception as e:
             response["result"] = {"content": [{"type": "text", "text": str(e)}], "isError": True}
@@ -122,11 +140,11 @@ def dispatch(project, role, depth, read_only, request):
     return response
 
 
-def serve(project: Project, role: str, depth=0, read_only=False):
+def serve(project: Project, role: str, depth=0, read_only=False, native=False):
     for line in sys.stdin:
         try:
             request = json.loads(line)
-            response = dispatch(project, role, depth, read_only, request)
+            response = dispatch(project, role, depth, read_only, request, native)
         except (ValueError, TypeError, AttributeError):
             response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Invalid JSON-RPC"}}
         if response is not None:
