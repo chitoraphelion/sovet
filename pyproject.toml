@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sovet"
+version = "0.1.0"
+description = "Two persistent coding agents, shared memory, ARIS, and chitalka"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+sovet = "sovet.cli:main"
+
+[tool.setuptools]
+packages = ["sovet"]

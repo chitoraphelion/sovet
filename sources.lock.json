@@ -1,0 +1,16 @@
+{
+  "aris": {
+    "url": "https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep.git",
+    "tested_commit": "26b95cfa0d8747078e9e43b42e20952709e561b8"
+  },
+  "longtails": {
+    "url": "https://github.com/k3nfalt/longtails.git",
+    "tested_source_commit": "6291564c7c3a37672f8ce9626e4e247e41f58ce6",
+    "toolchain": "leanprover/lean4:v4.35.0-rc2",
+    "note": "CLI adapters tested; full upstream theorem build/audit is a separate verification step."
+  },
+  "chitalka": {
+    "url": "https://github.com/chitoraphelion/chitalka.git",
+    "integration": "public CLI: list/show/reply/done/reopen; native locked store"
+  }
+}
