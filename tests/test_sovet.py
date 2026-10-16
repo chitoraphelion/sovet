@@ -91,6 +91,19 @@ class ProjectTest(unittest.TestCase):
         file.unlink()
         self.assertEqual(scan_files(self.p), 1)
 
+    def test_private_chitalka_notes_never_enter_watch_context(self):
+        scan_files(self.p)
+        private = self.root / "paper.pdf.notes.json"
+        private.write_text('{"text":"private reading note"}')
+        self.assertEqual(scan_files(self.p), 0)
+        private.write_text('{"text":"edited private note"}')
+        self.assertEqual(scan_files(self.p), 0)
+        private.unlink()
+        self.assertEqual(scan_files(self.p), 0)
+        self.assertNotIn("private reading note", self.p.context("claude")[0])
+        with self.p.db() as db:
+            self.assertFalse(list(db.execute("SELECT * FROM snapshots WHERE path LIKE '%.notes.json'")))
+
     def test_watch_detects_changes_beyond_diff_preview(self):
         file = self.root / "long-proof.lean"
         file.write_text("x" * 300_000 + "old")
@@ -160,6 +173,9 @@ role = os.path.basename(sys.argv[0])
 prompt = sys.stdin.read()
 if os.getenv("FAKE_HANG"):
     time.sleep(30)
+if os.getenv("FAKE_RATE_LIMIT"):
+    print(json.dumps({"type":"result", "is_error":True,"subtype":"success", "api_error_status":429,"result":"usage_limit_reached"}))
+    sys.exit(0)
 if os.getenv("FAKE_FAIL"):
     print(json.dumps({"type":"result", "is_error":True,"result":"test failure"}))
     sys.exit(1)
@@ -190,10 +206,28 @@ else:
                 self.assertEqual(readonly, role == "codex")
                 self.assertNotIn("--dangerously-skip-permissions", cmd)
 
+    def test_night_uses_real_adapters_and_resumes_both_fake_clis(self):
+        from sovet.night import NightRun
+        (self.root / "RESEARCH_BRIEF.md").write_text("bounded test task")
+        with patch.dict(os.environ, self.fake_cli()):
+            report = NightRun(self.p, "RESEARCH_BRIEF.md", max_turns=4, output=lambda _: None).run()
+        self.assertEqual(report["reason"], "max_turns")
+        self.assertIsNone(report["error"])
+        for role in ("claude", "codex"):
+            self.assertEqual(self.p.agent(role)["session"], role + "-persistent")
+        self.assertEqual(len([j for j in self.p.jobs() if j["status"] == "completed"]), 4)
+
     def test_native_failure_does_not_ack_context(self):
         env = self.fake_cli() | {"FAKE_FAIL": "1"}
         self.p.enqueue("claude", "work")
         with patch.dict(os.environ, env), self.assertRaisesRegex(RuntimeError, "test failure"):
+            NativeRun().run(self.p, "claude", self.p.claim("claude"))
+        self.assertEqual(self.p.agent("claude")["cursor"], 0)
+
+    def test_provider_limit_is_failure_even_with_zero_exit_and_success_subtype(self):
+        self.p.enqueue("claude", "work")
+        env = self.fake_cli() | {"FAKE_RATE_LIMIT": "1"}
+        with patch.dict(os.environ, env), self.assertRaisesRegex(RuntimeError, "usage_limit_reached"):
             NativeRun().run(self.p, "claude", self.p.claim("claude"))
         self.assertEqual(self.p.agent("claude")["cursor"], 0)
 

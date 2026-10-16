@@ -83,7 +83,7 @@ def watched_files(project: Project):
                          and not (Path(folder) / d).is_symlink())
         for name in sorted(files):
             path = Path(folder) / name
-            if name.startswith(".") or path.suffix not in extensions or path.is_symlink():
+            if name.startswith(".") or name.lower().endswith(".notes.json") or path.suffix not in extensions or path.is_symlink():
                 continue
             yield path
     for name in ("brief.md", "state.md", "decisions.md", "claims.json"):

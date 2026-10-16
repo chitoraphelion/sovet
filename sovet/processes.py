@@ -152,7 +152,7 @@ def legacy(p, tool):
             if len(args) < 2:
                 return None
             root_arg, args = args[1], args[2:]
-        if not args or args[0] not in ("native", "panel", "watch", "reader", "run", "research", "mcp"):
+        if not args or args[0] not in ("native", "panel", "watch", "reader", "run", "research", "mcp", "night"):
             return None
         if args[0] == "research" and args[1:2] != ["setup"]:
             return None

@@ -44,7 +44,8 @@ If a prompt conflicts with a queued job, follow the user's newest instruction an
 Chitalka reads PDF and Markdown with KaTeX math. Comments are author feedback: inspect document,
 source.file/line/lineEnd, quote and suggestion, edit source and verify the result. For source.how=markdown,
 line ranges identify the Markdown block and quote preserves TeX formulas; saving .md auto-refreshes the reader
-without latexmk. For PDF, rebuild/verify the PDF. Reply via chitalka_reply. Only the writer replies/closes comments. If latexmk -pvc is already running,
+without latexmk. For PDF, rebuild/verify the PDF. Reply via chitalka_reply. Only the writer replies/closes comments. Chitalka N-notes (*.notes.json) are private reading notes:
+never read them or deliver them to shared memory, research wiki, reviews or tasks. If latexmk -pvc is already running,
 read kommentarii/latexmk.log rather than starting another watcher.
 {profile_context(project)}
 {aris_context(project) if project.config.get('profile') == 'math-research' else 'Research automation is disabled in programming mode.'}

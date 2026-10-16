@@ -29,7 +29,8 @@ preserve all author text and thread entries. Inspect document, source.file/line/
 For source.how=markdown, the source range identifies a Markdown block and quote preserves TeX formulas;
 edit .md and verify the rendering (it auto-refreshes, no latexmk). For PDF, edit sources and verify/rebuild
 PDF. Then reply in the same comment. If latexmk -pvc already runs, inspect kommentarii/latexmk.log instead
-of launching a second watcher. Only the writer replies to comments. Never close an unverified fix."""
+of launching a second watcher. Only the writer replies to comments. Never close an unverified fix.
+Chitalka N-notes (*.notes.json) are private reading notes; never read them or deliver them to shared memory, wiki, reviews or tasks."""
     return f"""You are {role}, one member of a sovet team. Project: {project.root}.
 Your native conversation is persistent. Your teammate has a separate conversation.
 The current shared memory and event journal are supplied before every turn.

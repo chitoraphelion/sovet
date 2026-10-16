@@ -40,7 +40,7 @@ def complete(words):
                 return [s["id"] for s in list_sessions()]
             except RuntimeError:
                 return []
-        if dest in ("path", "pdf"):
+        if dest in ("path", "pdf", "task"):
             return paths(prefix, directories=chain == ["init"], base=root)
         if chain[:1] == ["research"] and dest == "target":
             lean = root / config["math"]["lean_root"]

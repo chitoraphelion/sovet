@@ -73,7 +73,7 @@ def stop_sessions(target=None, root=None, all_sessions=False, force=False, timeo
 
 KINDS = {"native": "{} (нативный TUI)", "launcher": "запуск {}", "panel": "{}: старая curses-панель",
          "run": "sovet run {}", "agent": "{}: headless-ход"}
-SERVICES = {"watch": "наблюдатель файлов", "reader": "chitalka", "mcp": "MCP-сервер", "research": "research setup"}
+SERVICES = {"night": "ночной цикл", "watch": "наблюдатель файлов", "reader": "chitalka", "mcp": "MCP-сервер", "research": "research setup"}
 
 
 def describe(kind):
