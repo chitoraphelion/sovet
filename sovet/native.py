@@ -10,6 +10,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import uuid
@@ -133,12 +134,23 @@ def run_native(project, role):
         env = dict(os.environ, SOVET_PROJECT=str(project.root), SOVET_ROLE=role, SOVET_NATIVE="1")
         if project.config.get("aris"):
             env["ARIS_REPO"] = project.config["aris"]["repo"]
-        process = subprocess.Popen(command, cwd=project.root, env=env)
-        record = register("sovet", "native:" + role, project.root, pid=process.pid)
+        process, record = None, None
+        previous = {sig: signal.getsignal(sig) for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)}
+        def shutdown(signum, _frame):
+            # tmux respawn sends HUP to the launcher; some native CLIs ignore
+            # HUP. Unwind through cleanup before releasing the role lease.
+            raise SystemExit(128 + signum)
+        signal.signal(signal.SIGHUP, shutdown)
+        signal.signal(signal.SIGTERM, shutdown)
         try:
+            process = subprocess.Popen(command, cwd=project.root, env=env)
+            # Set this after spawn so the child retains its own SIGINT behavior.
+            # The foreground native CLI owns Ctrl+C, not this waiting parent.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            record = register("sovet", "native:" + role, project.root, pid=process.pid)
             return process.wait()
         except BaseException:
-            if process.poll() is None:
+            if process is not None and process.poll() is None:
                 process.terminate()
                 try:
                     process.wait(timeout=5)
@@ -147,5 +159,7 @@ def run_native(project, role):
                     process.wait()
             raise
         finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
             unregister(record)
             metadata(project, f"native:{role}:connected", False)

@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import signal
 import tempfile
 import tomllib
 import unittest
@@ -10,7 +11,7 @@ from sovet.bridge import hook, inbox, complete_job
 from sovet.core import Project
 from sovet.integrations import metadata
 from sovet.mcp import call, available_tools
-from sovet.native import native_command, prepare_native
+from sovet.native import native_command, prepare_native, run_native
 
 
 class BridgeTests(unittest.TestCase):
@@ -131,6 +132,26 @@ class BridgeTests(unittest.TestCase):
         with patch("sovet.native.shutil.which", return_value="/bin/claude"):
             args = native_command(self.p, "claude")
         self.assertEqual(args[args.index("--resume") + 1], "real-native-session")
+
+    def test_launcher_hup_terminates_child_before_releasing_role(self):
+        from unittest.mock import Mock
+        child = Mock()
+        child.pid = 12345
+        child.poll.return_value = None
+        original = {sig: signal.getsignal(sig) for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)}
+        def wait(*_args, **_kwargs):
+            if not child.terminate.called:
+                signal.getsignal(signal.SIGHUP)(signal.SIGHUP, None)
+            return 0
+        child.wait.side_effect = wait
+        with patch("sovet.native.subprocess.Popen", return_value=child), \
+             patch("sovet.native.shutil.which", return_value="/fake/claude"), \
+             patch("sovet.native.register", return_value=None), self.assertRaises(SystemExit):
+            run_native(self.p, "claude")
+        child.terminate.assert_called_once()
+        self.assertGreaterEqual(child.wait.call_count, 2)
+        for sig, handler in original.items():
+            self.assertEqual(signal.getsignal(sig), handler)
 
 
 if __name__ == "__main__":
