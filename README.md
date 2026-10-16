@@ -182,6 +182,49 @@ sovet up --detach                # workers продолжают работать
 sovet stop
 ```
 
+Список **всех запущенных** сессий доступен из любой папки:
+
+```sh
+sovet sessions                     # или sovet ps
+sovet sessions --json
+sovet -C ~/path/to/paper sessions   # только этот проект
+sovet stop sovet-paper-ABCDEF       # ID из списка; вместо ID можно PID
+sovet stop                         # все процессы текущего проекта
+sovet stop --all                    # все сессии sovet этого пользователя
+sovet stop --all --force            # SIGKILL оставшихся после SIGTERM и ожидания
+```
+
+Источником истины служит `ps`, а реестр `~/.local/state/sovet/sessions/`
+(`$XDG_STATE_HOME` также поддерживается) добавляет метаданные проекта и помогает найти
+осиротевшие процессы моделей. Старые CLI-процессы обнаруживаются без реестра;
+их рабочая папка определяется через `/proc` или `lsof`.
+Остановка учитывает дочерние процессы, включая отдельные process groups: модели, MCP,
+читалку и сборщики. Перед каждым сигналом повторно проверяются UID, время запуска и
+команда процесса. Без доступа к `ps` команда завершится ошибкой и не станет угадывать PID.
+Посторонние сессии Claude/Codex, запущенные вне sovet, в выборку не входят.
+История, комментарии и ожидающие задачи не удаляются.
+
+Для независимых читалок: `chitalka sessions`, `chitalka stop PID`, `chitalka stop --all`.
+
+## Tab-автодополнение
+
+```sh
+sovet completion zsh --install
+chitalka completion zsh --install
+# Для Bash аналогично: completion bash --install
+```
+
+На текущей машине оба дополнения уже подключены к `~/.zshrc`. В новом терминале
+работает Tab для команд, флагов, путей, ролей и effort, ID запущенных сессий и
+комментариев chitalka. ID читаются локально, без запросов к моделям.
+Повторная установка заменяет только свой помеченный блок в конфиге оболочки.
+Для текущего терминала:
+
+```sh
+source ~/.local/share/sovet/completion/sovet.zsh
+source ~/.local/share/chitalka/completion/chitalka.zsh
+```
+
 `ask_peer` асинхронен: агент ставит поручение и завершает свой ход, ответ коллеги
 возвращается отдельным ходом. Это устраняет взаимное ожидание. Глубина цепочки ограничена;
 получение результата не запускает бесконечный цикл ревью. Ошибки остаются failed-задачами,
@@ -223,6 +266,7 @@ cd ~/code/sovet
 python3 -m unittest discover -s tests -v
 PYTHONPATH=. python3 tests/live_smoke.py  # opt-in: реальные запросы обоим провайдерам
 PYTHONPATH=. python3 tests/live_pipeline.py  # opt-in: запись -> ревью -> обратная доставка
+PYTHONPATH=. python3 tests/live_sessions.py  # opt-in: ps, остановка только созданных тестовых процессов
 ```
 
 Unit-тесты не вызывают модели. Live smoke использует CLI-авторизацию и делает по два

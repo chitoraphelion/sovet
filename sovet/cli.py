@@ -155,9 +155,20 @@ def parser():
     events.add_argument("--after", type=int, default=0)
     events.add_argument("--json", action="store_true")
     sub.add_parser("status", help="сессии, очередь и роли")
-    sub.add_parser("stop", help="остановить tmux-сессию проекта")
+    sessions = sub.add_parser("sessions", aliases=["ps"], help="все запущенные сессии по ps")
+    sessions.add_argument("--json", action="store_true")
+    sessions.add_argument("--ids", action="store_true", help=argparse.SUPPRESS)
+    stop = sub.add_parser("stop", help="остановить сессию и её дочерние процессы")
+    stop.add_argument("target", nargs="?", help="ID сессии или PID; по умолчанию текущий проект")
+    stop.add_argument("--all", action="store_true", help="все сессии sovet текущего пользователя")
+    stop.add_argument("--force", action="store_true", help="SIGKILL оставшихся после SIGTERM")
+    stop.add_argument("--timeout", type=float, default=8)
+    stop.add_argument("--json", action="store_true")
     doctor = sub.add_parser("doctor", help="проверить локальные инструменты без вызова моделей")
     doctor.add_argument("--json", action="store_true")
+    completion = sub.add_parser("completion", help="Tab-автодополнение zsh/bash")
+    completion.add_argument("shell", choices=["zsh", "bash"])
+    completion.add_argument("--install", action="store_true", help="подключить в конфиг текущего пользователя")
     w = sub.add_parser("watch", help="следить за файлами и обратной связью chitalka")
     w.add_argument("--once", action="store_true")
     memory = sub.add_parser("memory", help="общая память")
@@ -200,10 +211,21 @@ def stdin_text(value):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["_complete"]:
+        from .completion import complete
+        print("\n".join(complete(argv[1:])))
+        return 0
     args = parser().parse_args(argv)
     try:
+        if args.cmd in ("panel", "run", "watch", "reader", "mcp") or (args.cmd == "research" and args.action == "setup"):
+            from .processes import tracked
+            root = find_root(args.project)
+            kind = args.cmd + (":" + args.role if args.cmd in ("panel", "run") else "")
+            with tracked("sovet", kind, root):
+                return dispatch(args) or 0
         return dispatch(args) or 0
-    except (ValueError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+    except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print(f"sovet: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
@@ -211,6 +233,22 @@ def main(argv=None):
 
 
 def dispatch(args):
+    if args.cmd == "completion":
+        from .completion_support import install, script
+        print(install("sovet", args.shell) if args.install else script("sovet", args.shell), end="\n" if args.install else "")
+        return
+    if args.cmd in ("sessions", "ps"):
+        from .sessions import list_sessions, display
+        items = list_sessions(args.project)
+        print("\n".join(item["id"] for item in items) if args.ids else
+              json.dumps(items, ensure_ascii=False, indent=2) if args.json else display(items))
+        return
+    if args.cmd == "stop":
+        from .sessions import stop_sessions
+        result = stop_sessions(args.target, args.project, args.all, args.force, args.timeout)
+        print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else
+              f"Остановлены PID: {result['stopped'] or '-'}; остались: {result['remaining'] or '-'}")
+        return 1 if result["remaining"] or result["errors"] else 0
     if args.cmd == "init":
         project = Project.init(Path(args.project or args.path), writer=args.writer or "claude", brief=args.brief)
         configure(project, args)
@@ -263,8 +301,6 @@ def dispatch(args):
                           "jobs": project.jobs()}, ensure_ascii=False, indent=2))
     elif args.cmd == "watch":
         watch(project, args.once)
-    elif args.cmd == "stop":
-        return subprocess.call(["tmux", "kill-session", "-t", "=" + session_name(project)])
     elif args.cmd == "memory":
         if args.text is None:
             print((project.team / f"{args.name}.md").read_text())

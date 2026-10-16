@@ -16,6 +16,7 @@ from pathlib import Path
 from .core import atomic_write, lock
 from .integrations import aris_context
 from .research import profile_context
+from .processes import register, unregister
 
 LAUNCHER = Path(__file__).resolve().parents[1] / "bin/sovet"
 
@@ -87,6 +88,7 @@ class NativeRun:
     def __init__(self):
         self.process = None
         self.cancelled = threading.Event()
+        self.record = None
 
     def cancel(self):
         self.cancelled.set()
@@ -98,6 +100,22 @@ class NativeRun:
                 pass
 
     def run(self, project, role, job, output=lambda text: None):
+        try:
+            return self._leased_run(project, role, job, output)
+        finally:
+            if self.process and self.process.poll() is None:
+                self.cancel()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(self.process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    self.process.wait()
+            unregister(self.record)
+
+    def _leased_run(self, project, role, job, output):
         read_only = bool(job.get("read_only")) or role != project.config["writer"]
         if read_only:
             return self._run(project, role, job, output)
@@ -137,6 +155,7 @@ class NativeRun:
                                             stdout=subprocess.PIPE, stderr=err, text=True,
                                             encoding="utf-8", errors="replace", start_new_session=True)
             p = self.process
+            self.record = register("sovet", "agent:" + role, project.root, {"job": job["id"]}, pid=p.pid)
             lines = queue.Queue()
             def reader():
                 try:
