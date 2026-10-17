@@ -87,3 +87,72 @@ def test_deadline_does_not_start_a_turn(project):
         report = NightRun(project, 'RESEARCH_BRIEF.md', hours=1, output=lambda _: None).run()
     assert report['reason'] == 'deadline' and report['turns'] == 0
     execute.assert_not_called()
+
+
+def test_network_retry_preserves_review_routing_and_limits(project):
+    project.enqueue('codex', 'review existing result', read_only=True, depth=1, reply_to='claude')
+    attempts = []
+    def execute(p, role, output, controller):
+        job = p.claim(role)
+        attempts.append(job)
+        if len(attempts) == 1:
+            p.finish(job, error='Connection reset by peer')
+            return {'id': job['id'], 'ok': False, 'error': 'Connection reset by peer'}
+        return_job = dict(job)
+        p.finish(job, 'review finished')
+        return {'id': return_job['id'], 'ok': True}
+    runner = NightRun(project, 'RESEARCH_BRIEF.md', max_turns=2, output=lambda _: None)
+    with patch('sovet.night.execute_next', side_effect=execute), patch.object(runner, 'wait_for_retry') as wait:
+        report = runner.run()
+    assert [a['role'] for a in attempts] == ['codex', 'codex']
+    assert attempts[1]['reply_to'] == 'claude' and attempts[1]['depth'] == 1 and attempts[1]['read_only']
+    assert attempts[1]['origin'] == 'retry'
+    assert wait.call_args.args[0] == 15
+    assert report['reason'] == 'max_turns'
+    assert runner.pending('claude')['origin'] == 'peer-result'
+
+
+def test_network_retry_exhaustion_is_bounded(project):
+    def fail(p, role, **kwargs):
+        job = p.claim(role)
+        p.finish(job, error='stream disconnected before completion')
+        return {'id': job['id'], 'ok': False, 'error': 'stream disconnected before completion'}
+    runner = NightRun(project, 'RESEARCH_BRIEF.md', max_turns=20, retries=2, output=lambda _: None)
+    with patch('sovet.night.execute_next', side_effect=fail) as execute, patch.object(runner, 'wait_for_retry') as wait:
+        report = runner.run()
+    assert execute.call_count == 3 and wait.call_count == 2
+    assert [call.args[0] for call in wait.call_args_list] == [15, 30]
+    assert report['reason'] == 'failed'
+    assert len(project.jobs()) == 3
+    assert 'задачу #1' in project.jobs()[0]['prompt']
+    assert project.jobs()[0]['prompt'].count('после временного отказа') == 1
+
+
+def test_known_quota_reset_waits_without_treating_warning_as_rejection(project):
+    runner = NightRun(project, 'RESEARCH_BRIEF.md')
+    log = project.team / 'logs/claude-1.jsonl'
+    log.parent.mkdir()
+    job = {'id': 1, 'role': 'claude'}
+    def event(status, reset):
+        return json.dumps({'type': 'rate_limit_event', 'rate_limit_info': {'status': status, 'resetsAt': reset}})
+    log.write_text(event('allowed_warning', 500))
+    assert runner.retry_delay(job, 'usage_limit_reached') is None
+    log.write_text(event('rejected', 500))
+    with patch('sovet.night.time.time', return_value=100):
+        assert runner.retry_delay(job, 'usage_limit_reached') == 460
+    log.write_text(event('rejected', True))
+    assert runner.retry_delay(job, 'usage_limit_reached') is None
+    assert runner.retry_delay(job, 'permission denied') is None
+    assert NightRun(project, 'RESEARCH_BRIEF.md', retries=0).retry_delay(job, 'connection reset') is None
+
+
+def test_stop_while_waiting_preserves_queued_retry(project):
+    def fail(p, role, **kwargs):
+        job = p.claim(role)
+        p.finish(job, error='Connection reset by peer')
+        return {'id': job['id'], 'ok': False, 'error': 'Connection reset by peer'}
+    runner = NightRun(project, 'RESEARCH_BRIEF.md', output=lambda _: None)
+    with patch('sovet.night.execute_next', side_effect=fail) as execute, patch.object(runner, 'wait_for_retry', side_effect=lambda *_:runner.stop()):
+        report = runner.run()
+    assert report['reason'] == 'stopped' and report['error'] is None
+    assert report['pending_job'] and execute.call_count == 1

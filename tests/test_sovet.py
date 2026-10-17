@@ -180,6 +180,12 @@ if os.getenv("FAKE_FAIL"):
     print(json.dumps({"type":"result", "is_error":True,"result":"test failure"}))
     sys.exit(1)
 if role == "codex":
+    if os.getenv("FAKE_RECONNECT"):
+        print(json.dumps({"type":"error","message":"Reconnecting... 2/5 (Connection reset by peer)"}))
+        marker = os.getenv("FAKE_DISCONNECT_MARKER")
+        if marker and not os.path.exists(marker):
+            open(marker,"w").close()
+            sys.exit(1)
     print(json.dumps({"type":"thread.started", "thread_id":"codex-persistent"}))
     print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":"codex checked"}}))
     print(json.dumps({"type":"turn.completed"}))
@@ -216,6 +222,23 @@ else:
         for role in ("claude", "codex"):
             self.assertEqual(self.p.agent(role)["session"], role + "-persistent")
         self.assertEqual(len([j for j in self.p.jobs() if j["status"] == "completed"]), 4)
+
+    def test_reconnect_warning_does_not_fail_completed_codex_turn(self):
+        self.p.enqueue("codex", "review")
+        with patch.dict(os.environ, self.fake_cli() | {"FAKE_RECONNECT": "1"}):
+            result = NativeRun().run(self.p, "codex", self.p.claim("codex"))
+        self.assertIn("codex checked", result)
+
+    def test_night_recovers_disconnected_cli_and_preserves_session(self):
+        from sovet.night import NightRun
+        (self.root / "RESEARCH_BRIEF.md").write_text("review after recovery")
+        runner = NightRun(self.p, "RESEARCH_BRIEF.md", max_turns=3, output=lambda _: None)
+        env = self.fake_cli() | {"FAKE_RECONNECT": "1", "FAKE_DISCONNECT_MARKER": str(self.root / "disconnected-once")}
+        with patch.dict(os.environ, env), patch.object(runner, "wait_for_retry"):
+            report = runner.run()
+        self.assertIsNone(report["error"])
+        self.assertEqual([j["status"] for j in reversed(self.p.jobs())], ["completed", "failed", "completed", "pending"])
+        self.assertEqual(self.p.agent("codex")["session"], "codex-persistent")
 
     def test_native_failure_does_not_ack_context(self):
         env = self.fake_cli() | {"FAKE_FAIL": "1"}

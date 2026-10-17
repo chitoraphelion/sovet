@@ -151,6 +151,7 @@ class NativeRun:
         stderr_path = logdir / f"{role}-{job['id']}.stderr.log"
         events_path = logdir / f"{role}-{job['id']}.jsonl"
         chunks, final, failure, completed = [], "", None, False
+        reconnect_warning = None
         if self.cancelled.is_set():
             raise RuntimeError("Ход отменён")
         with stderr_path.open("w") as err, events_path.open("w") as raw:
@@ -223,7 +224,11 @@ class NativeRun:
                     elif kind == "turn.completed":
                         completed = True
                     elif kind in ("turn.failed", "error"):
-                        failure = str(event.get("error") or event.get("message") or event)
+                        message = str(event.get("error") or event.get("message") or event)
+                        if kind == "error" and message.lower().startswith("reconnecting..."):
+                            reconnect_warning = message
+                        else:
+                            failure = message
                 else:
                     if kind == "assistant":
                         for block in event.get("message", {}).get("content", []):
@@ -252,7 +257,7 @@ class NativeRun:
             raise RuntimeError(failure or "Ход отменён; следующая задача продолжит сохранённую сессию")
         if code or failure or not completed:
             tail = stderr_path.read_text()[-2500:]
-            raise RuntimeError(failure or f"{role}: exit={code}, нет события завершения. {tail}")
+            raise RuntimeError(failure or reconnect_warning or f"{role}: exit={code}, нет события завершения. {tail}")
         result = final or "\n\n".join(chunks)
         if not result.strip():
             raise RuntimeError(f"{role} завершился без ответа; журнал: {events_path}")
