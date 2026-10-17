@@ -206,11 +206,13 @@ class NativeRun:
             threading.Thread(target=writer, daemon=True).start()
             started = time.monotonic()
             cancelled_at = None
+            timed_out = False
             while True:
                 if self.cancelled.is_set() and cancelled_at is None:
                     self.cancel()
                     cancelled_at = time.monotonic()
                 if time.monotonic() - started > project.config["turn_timeout"]:
+                    timed_out = True
                     failure = "Превышено время хода"
                     self.cancel()
                     cancelled_at = cancelled_at or time.monotonic()
@@ -277,7 +279,7 @@ class NativeRun:
                 raise RuntimeError(f"{role} закрыл stdout, но не завершился; процесс остановлен")
             p.stdout.close()
         if self.cancelled.is_set():
-            raise RuntimeError(failure or "Ход отменён; следующая задача продолжит сохранённую сессию")
+            raise RuntimeError("Превышено время хода" if timed_out else failure or "Ход отменён; следующая задача продолжит сохранённую сессию")
         if code or failure or not completed:
             tail = stderr_path.read_text()[-2500:]
             raise RuntimeError(failure or reconnect_warning or f"{role}: exit={code}, нет события завершения. {tail}")

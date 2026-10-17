@@ -238,3 +238,47 @@ def test_rotation_changes_permissions_and_research_roles(project):
     assert 'claude review' in profile_context(project)
     assert 'Short focused review only.' in protocol(project,'claude',True)
     assert 'Short focused review only.' not in protocol(project,'codex',False)
+
+
+def test_turn_timeout_becomes_checkpoint_continuation_then_review(project):
+    roles=[]
+    prompts=[]
+    def execute(p, role, **kwargs):
+        roles.append(role)
+        if len(roles)==1:
+            job=p.claim(role)
+            p.finish(job,error='Превышено время хода')
+            return {'id':job['id'],'ok':False,'error':'Превышено время хода'}
+        with p.db() as db:
+            prompts.append(db.execute("SELECT prompt FROM jobs WHERE role=? AND status='pending' ORDER BY id LIMIT 1",(role,)).fetchone()[0])
+        return complete_turn(p,role,**kwargs)
+    runner=NightRun(project,'RESEARCH_BRIEF.md',max_turns=3,output=lambda _:None)
+    with patch('sovet.night.execute_next',side_effect=execute):
+        result=runner.run()
+    assert roles==['claude','claude','codex']
+    assert 'ТОЛЬКО восстановление checkpoint' in prompts[0]
+    assert result['reason']=='max_turns' and result['error'] is None
+    assert any(j['status']=='failed' for j in project.jobs())
+
+
+def test_inflight_checkpoint_exposes_job_and_completed_turn_count(project):
+    def execute(p,role,**kwargs):
+        state=json.loads((p.team/'night/latest.json').read_text())
+        assert state['reason']=='running' and state['active_role']==role
+        assert state['active_job']==1 and state['turns']==0
+        return complete_turn(p,role,**kwargs)
+    with patch('sovet.night.execute_next',side_effect=execute):
+        NightRun(project,'RESEARCH_BRIEF.md',max_turns=1,output=lambda _:None).run()
+
+
+def test_reviewer_timeout_continuation_never_requests_file_writes(project):
+    job_id=project.enqueue('codex','review lemma',read_only=True,reply_to='claude')
+    job=project.claim('codex')
+    project.finish(job,error='Превышено время хода')
+    runner=NightRun(project,'RESEARCH_BRIEF.md')
+    retry_id=runner.queue_retry(job,checkpoint_only=True)
+    retry=runner.pending('codex')
+    assert retry['id']==retry_id and retry['id']!=job_id
+    assert retry['read_only'] and retry['reply_to']=='claude'
+    assert 'Не редактируй файлы' in retry['prompt']
+    assert 'обнови NIGHT_REPORT.md' not in retry['prompt']

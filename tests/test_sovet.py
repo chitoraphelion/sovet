@@ -267,6 +267,12 @@ else:
             NativeRun().run(self.p, "claude", self.p.claim("claude"))
         self.assertEqual(self.p.agent("claude")["cursor"], 0)
 
+    def test_turn_deadline_keeps_timeout_reason_after_process_interrupt(self):
+        self.p.config['turn_timeout']=0.05
+        self.p.enqueue('codex','bounded work')
+        with patch.dict(os.environ,self.fake_cli() | {'FAKE_HANG':'1'}), self.assertRaisesRegex(RuntimeError,'Превышено время хода'):
+            NativeRun().run(self.p,'codex',self.p.claim('codex'))
+
     def test_native_cancel_stops_process_without_ack(self):
         env = self.fake_cli() | {"FAKE_HANG": "1"}
         self.p.enqueue("claude", "work")

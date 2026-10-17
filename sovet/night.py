@@ -86,6 +86,8 @@ class NightRun:
         if attempt >= self.retries:
             return None
         message = error.lower()
+        if message == "превышено время хода":
+            return 0
         network = ("connection reset", "stream disconnected", "error sending request",
                    "request timed out", "connection timed out", "connection refused",
                    "failed to send request", "temporary failure in name resolution",
@@ -110,13 +112,25 @@ class NightRun:
                 return max(60, reset - time.time() + 60)
         return None
 
-    def queue_retry(self, job):
+    def queue_retry(self, job, checkpoint_only=False):
         original = self.original_jobs.get(job["id"], job)
         prompt = (f"Продолжи задачу #{original['id']} после временного отказа провайдера. "
                   "Используй сохранённую сессию. Перечитай текущие файлы, память и очередь: "
                   "могли сохраниться частичные правки и уже поставленные запросы ревью. "
                   "Не перезаписывай свежие правки, не начинай выполненную работу заново "
                   "и не дублируй существующие запросы коллегам.\n\n" + original["prompt"])
+        if checkpoint_only and job["role"] != self.project.config["writer"]:
+            prompt += ("\n\nТекущий ход — ТОЛЬКО короткий частичный вердикт после таймаута ревью. "
+                       "Не редактируй файлы: сохрани read-only режим. Перечисли конкретные проверенные пункты, "
+                       "обнаруженные ошибки и то, что осталось непроверенным. Не начинай новую формализацию. "
+                       "Заверши ответ, чтобы ведущий мог сохранить checkpoint и продолжить.")
+        elif checkpoint_only:
+            prompt += ("\n\nТекущий ход — ТОЛЬКО восстановление checkpoint после таймаута. "
+                       "Исходное задание выше дано для контекста, не пытайся выполнить его целиком. "
+                       "Перечитай сохранённые правки и последние успешные проверки, обнови NIGHT_REPORT.md, "
+                       "claims и общую память, явно отделив сделанное от незаконченного. "
+                       "Не начинай новую исследовательскую ветку или новую формализацию. "
+                       "Заверши ход коротким отчётом и одним конкретным следующим шагом; координатор продолжит работу.")
         new_id = self.project.enqueue(job["role"], prompt, origin="retry", depth=job["depth"],
                                       read_only=bool(job["read_only"]), reply_to=job["reply_to"])
         self.retry_counts[new_id] = self.retry_counts.get(job["id"], 0) + 1
@@ -138,7 +152,8 @@ class NightRun:
         self.project.enqueue(self.project.config["writer"],
             f"Ночной исследовательский цикл. Перечитай {self.task.relative_to(self.project.root)}, "
             "общую память, последние замечания ревьюера и актуальные исходники. "
-            "Сделай следующий ограниченный проверяемый шаг по заданию. "
+            "Сделай ровно один небольшой проверяемый шаг по заданию и заверши ход. "
+            "Не объединяй сверку текущего результата, новую исследовательскую ветку и её формализацию в одном ходе. "
             "Обнови NIGHT_REPORT.md: результаты, точные предположения, проверки с командами, "
             "нерешённые вопросы и следующий шаг. Сохрани полезный checkpoint перед завершением хода. "
             "Не жди ответа коллеги: независимое ревью запустит координатор. Не запускай дополнительные CLI. "
@@ -201,6 +216,10 @@ class NightRun:
                         self.seed()
                         job = self.pending()
                     p.config["turn_timeout"] = min(p.config["turn_timeout"], remaining)
+                    atomic_write(p.team / "night/latest.json", json.dumps({**self.plan(), "started": started,
+                                 "turns": turns, "reason": "running", "error": None,
+                                 "active_job": job["id"], "active_role": job["role"], "updated": time.time()},
+                                 ensure_ascii=False, indent=2) + "\n")
                     self.controller = NativeRun()
                     result = execute_next(p, job["role"], output=self.output, controller=self.controller)
                     self.controller = None
@@ -214,7 +233,7 @@ class NightRun:
                             failure = (result or {}).get("error", "Нет результата хода")
                             delay = self.retry_delay(job, failure)
                             if delay is not None:
-                                retry_id = self.queue_retry(job)
+                                retry_id = self.queue_retry(job, checkpoint_only=failure == "Превышено время хода")
                                 resume_at = time.time() + delay
                                 wait_state = {**self.plan(), "started": started, "turns": turns,
                                               "reason": "waiting_retry", "error": failure,
