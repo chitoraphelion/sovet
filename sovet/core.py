@@ -178,7 +178,7 @@ class Project:
             if receipt is not None:
                 cur = db.execute("INSERT INTO jobs(role,prompt,origin,depth,read_only,reply_to,created) VALUES(?,?,?,?,?,?,?)",
                                  (job["reply_to"], receipt, "peer-result", self.config["max_peer_depth"],
-                                  int(job["reply_to"] != self.config["writer"]), None, time.time()))
+                                  int(not self.can_implement(job["reply_to"])), None, time.time()))
                 db.execute("INSERT INTO events(at,actor,kind,body,data) VALUES(?,?,?,?,?)",
                            (time.time(), "peer-result", "request", receipt,
                             json.dumps({"job": cur.lastrowid, "to": job["reply_to"]})))
@@ -239,8 +239,22 @@ class Project:
         data = p.read_bytes() if p.exists() else b""
         return {"path": str(p.relative_to(self.root)), "sha": digest(data), "text": data.decode("utf-8")}
 
+    def can_implement(self, role, path=None):
+        from .parallel import enabled, lane
+        if enabled(self):
+            spec = lane(self, role)
+            if path is None:
+                return bool(spec)
+            target = self.artifact(path)
+            for scope in spec.get("write_scopes", []):
+                allowed = self.artifact(scope.rstrip("/"))
+                if target == allowed or (scope.endswith("/") and target.is_relative_to(allowed)):
+                    return True
+            return False
+        return role == self.config["writer"]
+
     def write_artifact(self, path, text, expected_sha, actor="user", read_only=False):
-        if read_only or (actor in ROLES and actor != self.config["writer"]):
+        if read_only or (actor in ROLES and not self.can_implement(actor, path)):
             raise ValueError("Этот агент работает только в режиме ревью")
         p = self.artifact(path)
         with lock(self.team / "artifacts.lock"):

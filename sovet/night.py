@@ -35,6 +35,9 @@ class NightRun:
         self.retry_counts = {}
         self.original_jobs = {}
         self.project = project
+        from .parallel import enabled
+        if enabled(project):
+            raise ValueError("Параллельный research работает в нативных CLI: sovet up --math-research. Headless night для него отключён.")
         self.task = (project.root / task).resolve()
         if not self.task.is_relative_to(project.root) or not self.task.is_file():
             raise ValueError("--task: нужен существующий файл задания внутри проекта")

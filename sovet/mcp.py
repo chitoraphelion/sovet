@@ -5,6 +5,7 @@ import sys
 from .core import MEMORIES, ROLES, Project
 from .integrations import comments, reply
 from .research import run_lean, search, verification_status
+from . import parallel
 
 
 def tool(name, description, properties=None, required=()):
@@ -59,6 +60,10 @@ def available_tools(project, native=False):
         tools += MATH_TOOLS
     elif not project.config.get("reader"):
         tools = [t for t in tools if not t["name"].startswith("chitalka_")]
+    if parallel.enabled(project):
+        if not parallel.final_phase(project):
+            tools = [t for t in tools if t["name"] != "ask_peer"]
+        tools.append(tool("attack_finish", "Сохранить итог самостоятельной атаки. Финальное взаимное ревью откроется только после итогов обоих исследователей.", {"path": S, "summary": S}, ("path", "summary")))
     return tools + (NATIVE_TOOLS if native else [])
 
 
@@ -74,7 +79,14 @@ def call(project, role, depth, read_only, name, args, native=False):
         if name == "inbox":
             return inbox(project, role)
         if name == "job_finish":
-            return complete_job(project, role, args["result"], job_id=args.get("job_id"))
+            result = complete_job(project, role, args["result"], job_id=args.get("job_id"))
+            if parallel.enabled(project):
+                result["next"] = "Call inbox for your next independent research step and continue in this native harness; final dossier goes through attack_finish."
+            return result
+    if name == "attack_finish":
+        if read_only:
+            raise ValueError("Финальное ревью не может менять состояние самостоятельной атаки")
+        return parallel.finish(project, role, args["path"], args["summary"])
     if name == "lean_status":
         return verification_status(project)
     if name == "lean_check":

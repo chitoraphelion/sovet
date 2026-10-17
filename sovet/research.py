@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .core import Project, atomic_write, digest
+from .core import Project, atomic_write, digest, lock
 
 LONGTAILS_URL = "https://github.com/k3nfalt/longtails.git"
 
@@ -54,6 +54,14 @@ def setup(project: Project, source: Path | None = None, fetch_cache=False):
 
 
 def run_lean(project, action, target=None):
+    try:
+        with lock(project.team / "lean.lock", blocking=False):
+            return _run_lean(project, action, target)
+    except BlockingIOError:
+        raise RuntimeError("Другая Lean-проверка уже использует общий cache. Продолжайте математическую работу; повторите проверку позже, без polling-цикла.") from None
+
+
+def _run_lean(project, action, target=None):
     root = lean_root(project)
     if action == "check":
         if not target:
@@ -163,6 +171,9 @@ def search(project, query):
 def profile_context(project):
     if project.config.get("profile") != "math-research":
         return "Programming profile: implement scoped changes, run relevant checks and request independent peer review."
+    from .parallel import enabled
+    if enabled(project):
+        return "Independent parallel mathematical research: develop new hypotheses and algorithms, derive bounds and counterexamples in your own lane. Read the pinned LongTails AGENTS.md when using Lean. Reuse the paper notation. Keep exact oracle costs and honest proof status. Formalize substantive results after the search, not every minor bookkeeping change. No intermediate cross-model review; final comparison only after both attack_finish dossiers."
     return f"""Math-research profile for an optimization paper.
 Formal workspace: {project.config['math']['lean_root']} (LongTails + its pinned mathlib and Comparator).
 Read that workspace's AGENTS.md before modifying Lean. Use lean_search to find existing setups and lemmas;

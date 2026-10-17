@@ -21,20 +21,25 @@ from .integrations import aris_context, metadata
 from .processes import register, unregister
 from .research import profile_context
 from .runtime import codex_transport_args
+from . import parallel
 
 LAUNCHER = Path(__file__).resolve().parents[1] / "bin/sovet"
 
 
 def instructions(project, role):
     writer = project.config["writer"]
+    role_text = (parallel.instructions(project, role) if parallel.enabled(project) else
+                 f"Writer: {writer}. " + ("You implement changes." if role == writer else "You review; do not edit project source files."))
+    peer_text = ("No intermediate peer review. Work independently on your lane; attack_finish opens the final-only review phase."
+                 if parallel.enabled(project) else "Use ask_peer to queue a focused review request.")
     return f"""You are {role} in a sovet team, inside your ORIGINAL INTERACTIVE CLI.
-Project: {project.root}. Writer: {writer}. {'You implement changes.' if role == writer else 'You review; do not edit project source files.'}
+Project: {project.root}. {role_text}
 Your colleague uses the other native pane and has a separate conversation. Shared memory is .team/brief.md,
 .team/state.md and .team/decisions.md, plus the sovet event journal. Read memory_read and inbox before work
 and whenever the author changes requirements. Hooks may inject newer events; re-read changed files before writing.
 Author edits are authoritative. Use artifact_read/artifact_write with expected_sha for authored deliverables;
 do not overwrite a conflicting version. Save verified decisions with memory_append, never private reasoning.
-Use ask_peer to queue a focused review request. This does not run another hidden model or steal its session.
+{peer_text} This does not run another hidden model or steal its session.
 For this workspace use ONLY sovet ask_peer for cross-model consultation: no codex-companion, extra model
 worker, or ARIS reviewer subprocess. Keep both native foreground conversations in their own harnesses.
 An idle colleague receives it on its NEXT native turn; if needed ask the user to tell that pane to check inbox.
@@ -49,7 +54,7 @@ without latexmk. For PDF, rebuild/verify the PDF. Reply via chitalka_reply. Only
 never read them or deliver them to shared memory, research wiki, reviews or tasks. If latexmk -pvc is already running,
 read kommentarii/latexmk.log rather than starting another watcher.
 {profile_context(project)}
-{aris_context(project) if project.config.get('profile') == 'math-research' else 'Research automation is disabled in programming mode.'}
+{('Use ARIS research-wiki/research-refine for actual research; no auto-review-loop during the independent attack.' if parallel.enabled(project) else aris_context(project)) if project.config.get('profile') == 'math-research' else 'Research automation is disabled in programming mode.'}
 """
 
 
@@ -65,7 +70,7 @@ def prepare_native(project, role):
     hooks = {event: [{"hooks": [{"type": "command", "command": shlex.join(["env", "SOVET_NATIVE_INSTANCE=" + instance] + cmd + ["hook", "--role", role, "--event", event]),
                                  "timeout": 3 if event == "SessionEnd" else 10}]}] for event in hook_events}
     mcp_args = [str(LAUNCHER), "--project", str(project.root), "mcp", "--role", role, "--native"]
-    if role != project.config["writer"]:
+    if not project.can_implement(role):
         mcp_args.append("--read-only")
     mcp = {"command": sys.executable, "args": mcp_args}
     settings = folder / f"{role}-settings.json"
@@ -81,7 +86,7 @@ def native_command(project, role, prepared=None):
     if not binary:
         raise ValueError(f"Не найден {role} в PATH")
     prepared = prepared or prepare_native(project, role)
-    read_only = role != project.config["writer"]
+    read_only = not project.can_implement(role)
     session = metadata(project, f"native:{role}:session")
     legacy = project.agent(role)["session"]
     if not session and legacy:
@@ -107,7 +112,7 @@ def native_command(project, role, prepared=None):
             args += ["--session-id", session]
     else:
         args = [binary, "-m", project.config["models"][role], "-s", "read-only" if read_only else "workspace-write",
-                "-a", "on-request", "-C", str(project.root),
+                "-a", "on-request", "-C", str(parallel.working_dir(project, role)),
                 "-c", "model_reasoning_effort=" + json.dumps(project.config["effort"][role]),
                 "-c", "developer_instructions=" + json.dumps(instructions(project, role)),
                 "-c", "mcp_servers.sovet.command=" + json.dumps(prepared["mcp"]["command"]),
@@ -122,6 +127,8 @@ def native_command(project, role, prepared=None):
             args += ["-c", f"hooks.{event}={value}"]
         if session:
             args += ["resume", session]
+    if parallel.enabled(project):
+        args.append("Мы внутри sovet, начинаем самостоятельную исследовательскую атаку. Прочитай memory_read, вызови inbox и выполняй свою задачу до содержательного результата. Не превращай поиск в промежуточные взаимные ревью.")
     return args
 
 
@@ -134,6 +141,7 @@ def run_native(project, role):
         for job in interrupted:
             project.finish(job, error="Предыдущий исполнитель завершился; проверьте изменения перед повторным поручением.")
         metadata(project, f"native:{role}:job", 0)
+        parallel.ensure_job(project, role)
         prepared = prepare_native(project, role)
         command = native_command(project, role, prepared)
         env = dict(os.environ, SOVET_PROJECT=str(project.root), SOVET_ROLE=role, SOVET_NATIVE="1")
@@ -148,7 +156,7 @@ def run_native(project, role):
         signal.signal(signal.SIGHUP, shutdown)
         signal.signal(signal.SIGTERM, shutdown)
         try:
-            process = subprocess.Popen(command, cwd=project.root, env=env)
+            process = subprocess.Popen(command, cwd=parallel.working_dir(project, role), env=env)
             # Set this after spawn so the child retains its own SIGINT behavior.
             # The foreground native CLI owns Ctrl+C, not this waiting parent.
             signal.signal(signal.SIGINT, signal.SIG_IGN)

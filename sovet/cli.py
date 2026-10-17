@@ -35,6 +35,7 @@ def flags(parser):
     profile.add_argument("--programming", action="store_const", const="programming", dest="profile",
                          help="без исследовательских инструментов")
     parser.add_argument("--codex-transport", choices=["auto", "http"], help="транспорт Codex: auto или HTTP/SSE при обрывах WebSocket")
+    parser.add_argument("--research-mode", choices=["paired", "parallel"], help="исследование: писатель/ревьюер или две независимые нативные атаки")
     parser.add_argument("--writer", choices=ROLES, help="кто меняет файлы (второй агент — ревьюер)")
     for role in ROLES:
         parser.add_argument(f"--{role}-model", metavar="ID", help=f"точный ID модели {NAMES[role]}")
@@ -45,7 +46,7 @@ def flags(parser):
 def configure(project, args, persist=True):
     if getattr(args, "profile", None) == "programming":
         project.config["reader"] = False
-    for key in ("profile", "writer", "codex_transport"):
+    for key in ("profile", "writer", "codex_transport", "research_mode"):
         if getattr(args, key, None):
             project.config[key] = getattr(args, key)
     for role in ROLES:
@@ -74,7 +75,8 @@ def launch_command(project, *args):
 
 def role_label(project, role):
     cfg = project.config
-    duty = "писатель" if role == cfg["writer"] else "ревьюер"
+    from .parallel import enabled, lane
+    duty = lane(project, role)["topic"] if enabled(project) else "писатель" if role == cfg["writer"] else "ревьюер"
     return f"{NAMES[role]} · {duty} · {cfg['models'][role]} · {cfg['effort'][role]}"
 
 
@@ -253,7 +255,8 @@ def tmux(project, args):
     if dry:
         return 0
     writer = NAMES[project.config["writer"]]
-    hint = (f"tmux {name}: слева Codex, справа Claude. Курсор в панели {writer} (писатель).\n"
+    cursor_role = "исследователь" if project.config.get("research_mode") == "parallel" and project.config.get("profile") == "math-research" else "писатель"
+    hint = (f"tmux {name}: слева Codex, справа Claude. Курсор в панели {writer} ({cursor_role}).\n"
             "Ctrl-b ←/→ или щелчок мышью — другая панель; Ctrl-b w — окна watch/chitalka; "
             "Ctrl-b d — отсоединиться (агенты продолжат работу).\n"
             "Вернуться: sovet up · состояние: sovet status · остановить: sovet stop")
@@ -339,14 +342,14 @@ def status_data(project):
         live = [p for p in processes or [] if p["kind"] in (f"native:{role}", f"panel:{role}")]
         agents[role] = {**project.agent(role), "model": project.config["models"][role],
                         "effort": project.config["effort"][role],
-                        "duty": "writer" if role == project.config["writer"] else "reviewer",
+                        "duty": "researcher" if project.config.get("research_mode") == "parallel" and project.config.get("profile") == "math-research" else "writer" if role == project.config["writer"] else "reviewer",
                         "pids": [p["pid"] for p in live],
                         "legacy_panel": any(p["kind"].startswith("panel:") for p in live),
                         # The agents table may still hold a pre-native batch ID; only this one is resumed.
                         "native_session": metadata(project, f"native:{role}:session"),
                         "pane": state["agents"].get(role)}
     services = {kind: [p["pid"] for p in processes or [] if p["kind"] == kind] for kind in ("watch", "reader")}
-    return {"project": str(project.root), "profile": project.config["profile"], "writer": project.config["writer"],
+    return {"project": str(project.root), "profile": project.config["profile"], "writer": project.config["writer"], "research_mode": project.config.get("research_mode", "paired"),
             "reader": bool(project.config.get("reader")), "tmux": {"session": state["session"], "exists": state["exists"]},
             "ps_available": processes is not None, "agents": agents, "services": services, "jobs": project.jobs()}
 
@@ -356,8 +359,8 @@ def status_text(data):
         line = " ".join(str(text or "").split())
         return line if len(line) <= width else line[:width - 1] + "…"
     lines = [f"sovet · {data['project']}",
-             f"Профиль: {data['profile']} · chitalka: {'да' if data['reader'] else 'нет'} · "
-             f"писатель: {NAMES[data['writer']]}",
+             f"Профиль: {data['profile']} · chitalka: {'да' if data['reader'] else 'нет'} · " +
+             ("две независимые атаки" if data.get("research_mode") == "parallel" and data.get("profile") == "math-research" else f"писатель: {NAMES[data['writer']]}"),
              f"tmux: {data['tmux']['session']} — " + ("запущена (открыть: sovet up)" if data["tmux"]["exists"]
                                                        else "не запущена (sovet up)"), ""]
     for role in (data["writer"], *[r for r in ROLES if r != data["writer"]]):
@@ -373,7 +376,7 @@ def status_text(data):
             state = "не запущен" if data["ps_available"] else "неизвестно (ps недоступен)"
         session = f" · разговор {a['native_session'][:8]}…" if a.get("native_session") else ""
         model = f"{a['model']} · {a['effort']}"
-        lines.append(f"  {NAMES[role]:<7}{('писатель' if a['duty'] == 'writer' else 'ревьюер'):<10}"
+        lines.append(f"  {NAMES[role]:<7}{({'writer':'писатель','reviewer':'ревьюер','researcher':'исследователь'}[a['duty']]):<14} "
                      f"{model:<28} {side:<7} {state}{session}")
     services = " · ".join(f"{name} PID {','.join(map(str, pids))}" if pids else f"{name}: нет"
                           for name, pids in data["services"].items())
@@ -604,6 +607,9 @@ def dispatch(args):
             report = runner.run()
             return 1 if report["error"] else 0
     elif args.cmd == "run":
+        from .parallel import enabled
+        if enabled(project):
+            raise ValueError("Параллельные исследователи запускаются в нативном режиме: sovet up --math-research")
         live = live_processes(project) or []
         if any(p["kind"] in (f"native:{args.role}", f"panel:{args.role}") for p in live):
             raise ValueError(f"{NAMES[args.role]} открыт в tmux; задачу получит его панель. "

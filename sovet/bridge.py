@@ -32,6 +32,8 @@ def claim_inbox(project, role):
     existing = active_job(project, role)
     if existing:
         return existing
+    from .parallel import ensure_job
+    ensure_job(project, role)
     job = project.claim(role)
     if job:
         metadata(project, key(role, "job"), job["id"])
