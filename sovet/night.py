@@ -7,6 +7,7 @@ import signal
 import threading
 import time
 from contextlib import ExitStack
+from datetime import datetime
 from pathlib import Path
 
 from .core import Project, atomic_write, lock
@@ -16,11 +17,20 @@ from .runtime import NativeRun, execute_next, worker_lock
 
 
 class NightRun:
-    def __init__(self, project, task, hours=8, max_turns=32, output=print, retries=3):
+    def __init__(self, project, task, hours=8, max_turns=32, output=print, retries=3, reviewer_after=None):
         if not math.isfinite(hours) or hours <= 0 or max_turns < 1:
             raise ValueError("Нужны конечные --hours > 0 и --max-turns >= 1")
         if retries < 0:
             raise ValueError("--retries должен быть >= 0")
+        self.reviewer_not_before = 0.0
+        if reviewer_after:
+            try:
+                when = datetime.fromisoformat(reviewer_after)
+                if when.tzinfo is None:
+                    raise ValueError("timezone required")
+                self.reviewer_not_before = when.timestamp()
+            except (ValueError, TypeError, OverflowError):
+                raise ValueError("--reviewer-after: нужен ISO timestamp с timezone, например 2026-10-17T20:31:00+03:00") from None
         self.retries = retries
         self.retry_counts = {}
         self.original_jobs = {}
@@ -43,16 +53,33 @@ class NightRun:
         p = self.project
         return {"project": str(p.root), "task": str(self.task.relative_to(p.root)),
                 "hours": self.hours, "max_turns": self.max_turns, "retries": self.retries,
+                "reviewer_not_before": self.reviewer_not_before or None,
                 "writer": p.config["writer"], "models": p.config["models"], "effort": p.config["effort"],
                 "mode": "headless; exclusive role leases; bounded retries for network failures and known quota resets",
                 "note": "Native tmux agent panes must be closed for this project. No models run in --dry-run."}
 
-    def pending(self, role=None):
+    def pending(self, role=None, include_deferred=False):
+        writer = self.project.config["writer"]
+        reviewer = "codex" if writer == "claude" else "claude"
+        conditions, params = ["status='pending'"], []
+        if role:
+            conditions.append("role=?")
+            params.append(role)
+        if not include_deferred and time.time() < self.reviewer_not_before:
+            conditions.append("role!=?")
+            params.append(reviewer)
         with self.project.db() as db:
-            row = db.execute("SELECT * FROM jobs WHERE status='pending' " +
-                             ("AND role=? " if role else "") + "ORDER BY id LIMIT 1",
-                             (role,) if role else ()).fetchone()
+            row = db.execute("SELECT * FROM jobs WHERE " + " AND ".join(conditions) + " ORDER BY id LIMIT 1", params).fetchone()
             return dict(row) if row else None
+
+    def reviewer_wait(self, started, turns, deadline, reviewer):
+        state = {**self.plan(), "started": started, "turns": turns,
+                 "reason": "waiting_reviewer", "error": None,
+                 "pending_job": (self.pending(reviewer, include_deferred=True) or {}).get("id"),
+                 "resume_at": self.reviewer_not_before}
+        atomic_write(self.project.team / "night/latest.json", json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+        self.output(f"Сохраняю ходы для ревью {reviewer}; ожидание до {datetime.fromtimestamp(self.reviewer_not_before).astimezone().isoformat()}.")
+        self.wait_for_retry(max(0, self.reviewer_not_before-time.time()), deadline)
 
     def retry_delay(self, job, error):
         attempt = self.retry_counts.get(job["id"], 0)
@@ -114,7 +141,9 @@ class NightRun:
             "Сделай следующий ограниченный проверяемый шаг по заданию. "
             "Обнови NIGHT_REPORT.md: результаты, точные предположения, проверки с командами, "
             "нерешённые вопросы и следующий шаг. Сохрани полезный checkpoint перед завершением хода. "
-            "Не жди ответа коллеги: независимое ревью запустит координатор. Не запускай дополнительные CLI.\n\n" + text,
+            "Не жди ответа коллеги: независимое ревью запустит координатор. Не запускай дополнительные CLI. "
+            "Если ревьюер временно недоступен, продолжай ограниченные задачи самостоятельно, "
+            "но явно отмечай новые результаты как не прошедшие независимое ревью.\n\n" + text,
             origin="night")
 
     def run(self):
@@ -161,6 +190,12 @@ class NightRun:
                     scan_files(p)
                     if p.config.get("profile") == "math-research" or p.config.get("reader"):
                         sync_comments(p)
+                    reserve = min(2, self.max_turns-1)
+                    if (reserve and turns >= self.max_turns-reserve
+                            and time.time() < self.reviewer_not_before
+                            and self.pending(reviewer, include_deferred=True)):
+                        self.reviewer_wait(started, turns, deadline, reviewer)
+                        continue
                     job = self.pending()
                     if job is None:
                         self.seed()
@@ -191,13 +226,19 @@ class NightRun:
                                 if turns >= self.max_turns:
                                     reason = "max_turns"
                                     break
+                                if job["role"] == reviewer:
+                                    self.reviewer_not_before = max(self.reviewer_not_before, resume_at)
+                                    wait_state.update(reason="running", reviewer_not_before=self.reviewer_not_before)
+                                    atomic_write(p.team / "night/latest.json", json.dumps(wait_state, ensure_ascii=False, indent=2) + "\n")
+                                    self.output(f"{writer} продолжает работу; ревью {reviewer} остаётся в очереди до восстановления доступа.")
+                                    continue
                                 self.wait_for_retry(delay, deadline)
                                 wait_state.update(reason="running", resume_at=None, error=None)
                                 atomic_write(p.team / "night/latest.json", json.dumps(wait_state, ensure_ascii=False, indent=2) + "\n")
                                 continue
                             reason, error = "failed", failure
                         break
-                    if job["role"] == writer and self.pending(reviewer) is None:
+                    if job["role"] == writer and self.pending(reviewer, include_deferred=True) is None:
                         p.enqueue(reviewer,
                             f"Независимо проверь последний результат писателя по {self.task.relative_to(p.root)} "
                             "и NIGHT_REPORT.md. Читай действительные исходники и свидетельства проверок. "
@@ -211,7 +252,7 @@ class NightRun:
             finally:
                 p.config = Project(p.root).config
                 report = {**self.plan(), "started": started, "finished": time.time(), "turns": turns,
-                          "reason": reason, "error": error, "pending_job": (self.pending() or {}).get("id"),
+                          "reason": reason, "error": error, "pending_job": (self.pending(include_deferred=True) or {}).get("id"),
                           "research_report": "NIGHT_REPORT.md", "logs": ".team/logs"}
                 atomic_write(p.team / "night/latest.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
                 p.emit("night", "stop", json.dumps(report, ensure_ascii=False))

@@ -102,12 +102,12 @@ def test_network_retry_preserves_review_routing_and_limits(project):
         p.finish(job, 'review finished')
         return {'id': return_job['id'], 'ok': True}
     runner = NightRun(project, 'RESEARCH_BRIEF.md', max_turns=2, output=lambda _: None)
-    with patch('sovet.night.execute_next', side_effect=execute), patch.object(runner, 'wait_for_retry') as wait:
+    with patch('sovet.night.execute_next', side_effect=execute), patch.object(runner, 'wait_for_retry', side_effect=lambda *_:setattr(runner, 'reviewer_not_before', 0)) as wait:
         report = runner.run()
     assert [a['role'] for a in attempts] == ['codex', 'codex']
     assert attempts[1]['reply_to'] == 'claude' and attempts[1]['depth'] == 1 and attempts[1]['read_only']
     assert attempts[1]['origin'] == 'retry'
-    assert wait.call_args.args[0] == 15
+    assert wait.call_args.args[0] == pytest.approx(15, abs=1)
     assert report['reason'] == 'max_turns'
     assert runner.pending('claude')['origin'] == 'peer-result'
 
@@ -156,3 +156,85 @@ def test_stop_while_waiting_preserves_queued_retry(project):
         report = runner.run()
     assert report['reason'] == 'stopped' and report['error'] is None
     assert report['pending_job'] and execute.call_count == 1
+
+
+def test_unavailable_reviewer_does_not_block_writer_and_is_not_duplicated(project):
+    project.config['writer'] = 'codex'
+    project.save_config()
+    runner = NightRun(project, 'RESEARCH_BRIEF.md', max_turns=4,
+                      reviewer_after='2099-01-01T20:31:00+03:00', output=lambda _:None)
+    roles = []
+    def execute(p, role, **kwargs):
+        roles.append(role)
+        if roles == ['codex', 'codex']:
+            with p.db() as db:
+                assert db.execute("SELECT count(*) FROM jobs WHERE role='claude' AND status='pending'").fetchone()[0] == 1
+        if role == 'claude':
+            assert runner.reviewer_not_before == 0
+        return complete_turn(p, role, **kwargs)
+    with patch('sovet.night.execute_next', side_effect=execute), patch.object(runner, 'wait_for_retry', side_effect=lambda *_:setattr(runner, 'reviewer_not_before', 0)) as wait:
+        report = runner.run()
+    assert roles == ['codex', 'codex', 'claude', 'codex']
+    assert wait.call_count == 1 and report['error'] is None
+
+
+def test_deferred_oldest_job_is_preserved_when_turn_budget_ends(project):
+    project.config['writer'] = 'codex'
+    project.save_config()
+    review = project.enqueue('claude', 'independent review', read_only=True, reply_to='codex')
+    runner = NightRun(project, 'RESEARCH_BRIEF.md', max_turns=1,
+                      reviewer_after='2099-01-01T20:31:00+03:00', output=lambda _:None)
+    roles=[]
+    def execute(p, role, **kwargs):
+        roles.append(role)
+        return complete_turn(p, role, **kwargs)
+    with patch('sovet.night.execute_next', side_effect=execute):
+        report = runner.run()
+    assert roles == ['codex']
+    assert report['pending_job'] == review
+    assert runner.pending('claude') is None
+    assert runner.pending('claude', include_deferred=True)['id'] == review
+
+
+def test_reviewer_known_quota_cooldown_keeps_writer_working(project):
+    project.config['writer']='codex'
+    project.save_config()
+    roles=[]
+    runner=NightRun(project, 'RESEARCH_BRIEF.md', max_turns=5, output=lambda _:None)
+    def execute(p, role, **kwargs):
+        roles.append(role)
+        if role=='claude':
+            job=p.claim(role)
+            folder=p.team/'logs';folder.mkdir(exist_ok=True)
+            (folder/f"claude-{job['id']}.jsonl").write_text(json.dumps({'type':'rate_limit_event','rate_limit_info':{'status':'rejected','resetsAt':4070908800}}))
+            p.finish(job,error='usage_limit_reached')
+            return {'id':job['id'],'ok':False,'error':'usage_limit_reached'}
+        return complete_turn(p, role, **kwargs)
+    with patch('sovet.night.execute_next',side_effect=execute), patch.object(runner,'wait_for_retry',side_effect=lambda *_:runner.stop()):
+        report=runner.run()
+    assert roles==['codex','claude','codex']
+    assert report['reason']=='stopped' and report['error'] is None
+    assert runner.pending('claude',include_deferred=True)
+
+
+def test_reviewer_after_requires_explicit_timezone(project):
+    for timestamp in ('tomorrow','2026-10-17T20:30:00'):
+        with pytest.raises(ValueError,match='reviewer-after'):
+            NightRun(project,'RESEARCH_BRIEF.md',reviewer_after=timestamp)
+
+
+def test_rotation_changes_permissions_and_research_roles(project):
+    from sovet.runtime import command, protocol
+    from sovet.research import profile_context
+    project.config.update(writer='codex',profile='math-research',review_instructions={'claude':'Short focused review only.'})
+    with patch('sovet.runtime.shutil.which', side_effect=lambda name:'/tmp/'+name):
+        coder, readonly=command(project,'codex',{'read_only':False},'saved-codex')
+        reviewer, reviewonly=command(project,'claude',{'read_only':True},None)
+    assert not readonly and coder[coder.index('-s')+1]=='workspace-write'
+    assert reviewonly and 'Read,Grep,Glob,ToolSearch' in reviewer
+    mcp=json.loads((project.team/'mcp-claude.json').read_text())
+    assert '--read-only' in mcp['mcpServers']['sovet']['args']
+    assert 'codex derivation/formalization' in profile_context(project)
+    assert 'claude review' in profile_context(project)
+    assert 'Short focused review only.' in protocol(project,'claude',True)
+    assert 'Short focused review only.' not in protocol(project,'codex',False)

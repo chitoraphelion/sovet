@@ -175,6 +175,6 @@ Maintain .team/claims.json: link each paper claim to setup, theorem, explicit bu
 Mark an assertion audited only after successful Comparator output for the CURRENT source revision; after edits
 rerun verification. Do not label prose claims formalized merely because a related lemma compiles.
 Use research-wiki to record assumptions, failed attempts and verified results. Chitalka feedback is author input.
-Research sequence: author setup -> Claude derivation/formalization -> Lean build -> Comparator -> Codex review
+Research sequence: author setup -> {project.config["writer"]} derivation/formalization -> Lean build -> Comparator -> {"codex" if project.config["writer"] == "claude" else "claude"} review
 of assumptions and oracle counts -> paper/source update -> author review in chitalka.
 """

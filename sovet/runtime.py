@@ -42,6 +42,7 @@ def codex_transport_args(project):
 
 
 def protocol(project, role, read_only):
+    review_instructions = project.config.get("review_instructions", {}).get(role, "") if read_only else ""
     reader_instructions = ""
     if project.config.get("profile") == "math-research" or project.config.get("reader"):
         reader_instructions = """Chitalka is the author's native PDF and Markdown reader with KaTeX math. Use chitalka_list and chitalka_reply,
@@ -62,6 +63,7 @@ Use ask_peer for independent review. It queues work and returns immediately: nev
 never call claude/codex CLI yourself, and never create recursive agent chains. Finish your turn normally;
 the peer result will be delivered back in a separate turn. Keep requests bounded and concrete.
 {reader_instructions}
+{review_instructions}
 {profile_context(project)}
 {aris_context(project) if project.config.get('profile') == 'math-research' else 'Use independent peer review; research automation is disabled in programming mode.'}
 """

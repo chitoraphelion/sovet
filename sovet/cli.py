@@ -434,6 +434,7 @@ def parser():
     night.add_argument("--hours", type=float, default=8, help="максимальная длительность (по умолчанию 8 ч)")
     night.add_argument("--max-turns", type=int, default=32, help="не более указанного числа ходов обоих агентов")
     night.add_argument("--retries", type=int, default=3, help="повторы сетевого сбоя или известного лимита на задачу (по умолчанию 3)")
+    night.add_argument("--reviewer-after", help="не вызывать ревьюера до ISO времени с timezone; писатель продолжает работу")
     night.add_argument("--dry-run", action="store_true", help="показать план, не запускать модели")
     run = sub.add_parser("run", help="выполнить одну задачу очереди без TUI (только если роль не открыта)")
     run.add_argument("role", choices=ROLES)
@@ -596,7 +597,7 @@ def dispatch(args):
         return main_hook(project, args.role, args.event)
     elif args.cmd == "night":
         from .night import NightRun
-        runner = NightRun(project, args.task, args.hours, args.max_turns, retries=args.retries)
+        runner = NightRun(project, args.task, args.hours, args.max_turns, retries=args.retries, reviewer_after=args.reviewer_after)
         if args.dry_run:
             print(json.dumps(runner.plan(), ensure_ascii=False, indent=2))
         else:
