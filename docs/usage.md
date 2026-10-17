@@ -60,6 +60,28 @@ sovet run codex                                            # одна задач
 Статусы задач: `ждёт` → `выполняется` → `готово` / `ошибка`. Когда и как задача
 доставляется, описано в разделе README «Как проходит ревью».
 
+## Обрывы соединения Codex
+
+Если в журнале повторяются `websocket closed by server` / `Connection reset by peer`,
+для проекта с обычным входом Codex через ChatGPT можно выбрать HTTP/SSE:
+
+```sh
+sovet config --codex-transport http
+# вернуть штатный выбор транспорта:
+sovet config --codex-transport auto
+```
+
+Настройка применяется к следующим headless/TUI-запускам этого проекта; текущий процесс
+нужно завершить с сохранением состояния и продолжить. Используется именованный provider
+`sovet_http` с тем же ChatGPT backend и существующей авторизацией Codex. Модель, reasoning,
+conversation ID и sandbox сохраняются; глобальный config Codex не переписывается.
+Этот вариант предназначен для ChatGPT login, не для стороннего API-provider.
+
+[Официальная настройка `supports_websockets`](https://learn.chatgpt.com/docs/config-file/config-reference)
+управляет транспортом Responses. Встроенный provider `openai` не переопределяется;
+для HTTP создаётся отдельный ID. Переключение транспорта само по себе не гарантирует
+доступность сервиса; ограниченные сетевые повторы продолжают действовать.
+
 ## Ночной цикл без присмотра
 
 ```sh

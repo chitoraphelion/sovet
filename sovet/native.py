@@ -20,6 +20,7 @@ from .core import atomic_write, lock
 from .integrations import aris_context, metadata
 from .processes import register, unregister
 from .research import profile_context
+from .runtime import codex_transport_args
 
 LAUNCHER = Path(__file__).resolve().parents[1] / "bin/sovet"
 
@@ -112,6 +113,7 @@ def native_command(project, role, prepared=None):
                 "-c", "mcp_servers.sovet.command=" + json.dumps(prepared["mcp"]["command"]),
                 "-c", "mcp_servers.sovet.args=" + json.dumps(prepared["mcp"]["args"]),
                 "-c", f"mcp_servers.sovet.tool_timeout_sec={project.config['math']['timeout'] + 30}"]
+        args += codex_transport_args(project)
         for event, handlers in prepared["hooks"].items():
             # CLI TOML overrides accept arrays of inline tables, not JSON objects.
             command = handlers[0]["hooks"][0]["command"]

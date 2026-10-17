@@ -21,6 +21,26 @@ from .processes import register, unregister
 LAUNCHER = Path(__file__).resolve().parents[1] / "bin/sovet"
 
 
+def codex_transport_args(project):
+    transport = project.config.get("codex_transport", "auto")
+    if transport == "auto":
+        return []
+    if transport != "http":
+        raise ValueError("codex_transport: ожидается auto или http")
+    # Built-in provider IDs cannot be overridden. This named provider uses the
+    # same ChatGPT endpoint and existing Codex sign-in, with HTTP/SSE transport.
+    settings = {"model_provider": "sovet_http",
+                "model_providers.sovet_http.name": "Sovet HTTP",
+                "model_providers.sovet_http.base_url": "https://chatgpt.com/backend-api/codex",
+                "model_providers.sovet_http.wire_api": "responses",
+                "model_providers.sovet_http.requires_openai_auth": True,
+                "model_providers.sovet_http.supports_websockets": False}
+    args = []
+    for key, value in settings.items():
+        args.extend(["-c", key + "=" + json.dumps(value)])
+    return args
+
+
 def protocol(project, role, read_only):
     reader_instructions = ""
     if project.config.get("profile") == "math-research" or project.config.get("reader"):
@@ -66,6 +86,7 @@ def command(project, role, job, session):
                "-c", "mcp_servers.sovet.command=" + json.dumps(mcp["command"]),
                "-c", "mcp_servers.sovet.args=" + json.dumps(mcp["args"]),
                "-c", f"mcp_servers.sovet.tool_timeout_sec={project.config['math']['timeout'] + 30}"]
+        cmd.extend(codex_transport_args(project))
         if session:
             cmd.extend(["resume", session])
         cmd.append("-")

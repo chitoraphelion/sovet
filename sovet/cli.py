@@ -34,6 +34,7 @@ def flags(parser):
                          help="Lean/LongTails, ARIS, chitalka")
     profile.add_argument("--programming", action="store_const", const="programming", dest="profile",
                          help="без исследовательских инструментов")
+    parser.add_argument("--codex-transport", choices=["auto", "http"], help="транспорт Codex: auto или HTTP/SSE при обрывах WebSocket")
     parser.add_argument("--writer", choices=ROLES, help="кто меняет файлы (второй агент — ревьюер)")
     for role in ROLES:
         parser.add_argument(f"--{role}-model", metavar="ID", help=f"точный ID модели {NAMES[role]}")
@@ -44,7 +45,7 @@ def flags(parser):
 def configure(project, args, persist=True):
     if getattr(args, "profile", None) == "programming":
         project.config["reader"] = False
-    for key in ("profile", "writer"):
+    for key in ("profile", "writer", "codex_transport"):
         if getattr(args, key, None):
             project.config[key] = getattr(args, key)
     for role in ROLES:

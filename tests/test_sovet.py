@@ -240,6 +240,19 @@ else:
         self.assertEqual([j["status"] for j in reversed(self.p.jobs())], ["completed", "failed", "completed", "pending"])
         self.assertEqual(self.p.agent("codex")["session"], "codex-persistent")
 
+    def test_http_transport_keeps_model_session_and_permissions(self):
+        from sovet.runtime import codex_transport_args
+        self.assertEqual(codex_transport_args(self.p), [])
+        configure(self.p, parser().parse_args(["config", "--codex-transport", "http"]), persist=False)
+        args, readonly = command(self.p, "codex", {"read_only": True}, "saved-session")
+        self.assertIn('model_provider="sovet_http"', args)
+        self.assertIn('model_providers.sovet_http.supports_websockets=false', args)
+        self.assertIn('model_providers.sovet_http.requires_openai_auth=true', args)
+        self.assertIn('gpt-6.1-sol', args)
+        self.assertEqual(args[-3:], ["resume", "saved-session", "-"])
+        self.assertTrue(readonly)
+        self.assertNotIn('--dangerously-skip-permissions', args)
+
     def test_native_failure_does_not_ack_context(self):
         env = self.fake_cli() | {"FAKE_FAIL": "1"}
         self.p.enqueue("claude", "work")
